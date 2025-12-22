@@ -1,0 +1,25 @@
+# Server
+fastapi
+uvicorn[standard]
+websockets
+
+# AI/ML - General
+torch
+transformers
+sentencepiece
+python-dotenv
+soundfile
+
+# STT (Speech-to-Text)
+mlx-whisper
+pydub
+numpy
+
+# TTS (Text-to-Speech)
+styletts2
+pyttsx3
+kokoro
+
+# LLM (Language Models)
+mlx-lm
+groq

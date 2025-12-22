@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Assistant Client</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            text-align: center;
+            background-color: white;
+            padding: 40px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            width: 90%;
+            max-width: 600px;
+        }
+        h1 {
+            color: #1c1e21;
+        }
+        #status {
+            margin: 20px 0;
+            font-size: 1.2em;
+            color: #606770;
+            height: 30px;
+        }
+        #recordButton {
+            background-color: #42b72a;
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        #recordButton.recording {
+            background-color: #fa3e3e;
+        }
+        #recordButton:hover {
+            opacity: 0.9;
+        }
+        #log {
+            margin-top: 30px;
+            text-align: left;
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-radius: 8px;
+            height: 150px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+        }
+        #log p {
+            margin: 5px 0;
+            padding: 0;
+        }
+        .user-text {
+            color: #0056b3;
+        }
+        .llm-text {
+            color: #28a745;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Voice Assistant</h1>
+        <p id="status">Click the button and start speaking</p>
+        <button id="recordButton">Hold to Speak</button>
+        <div id="log"></div>
+        <audio id="audioPlayer" style="display: none;"></audio>
+    </div>
+
+    <script src="/main.js"></script>
+</body>
+</html>
