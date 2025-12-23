@@ -1,24 +1,30 @@
 import io
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from time import perf_counter
+from typing import Generator, Optional, Tuple
 
 import numpy as np
+import torch
 import pyttsx3
 from pydub import AudioSegment
 
 try:
-    from kokoro import TTS as KokoroTTS
-except Exception:
-    KokoroTTS = None
+    from kokoro import KModel, KPipeline
+except Exception as e:
+    # Make it clear when Kokoro is not available so we know why we fell back.
+    print(f"Kokoro import failed; falling back to 'say' then pyttsx3. Error: {e}")
+    KModel = None
+    KPipeline = None
 
 # macOS built-in "say" produces natural voices and remains a fallback.
 # Kokoro is the new primary local TTS.
 SAY_BIN = "/usr/bin/say"
 DEFAULT_MAC_VOICE = os.getenv("MAC_TTS_VOICE", "Samantha")
-DEFAULT_KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_alloy")
+DEFAULT_KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_MODEL_PATH = os.getenv(
     "KOKORO_MODEL_PATH",
     str(Path(__file__).resolve().parent.parent / "models" / "kokoro-v1_0.pth"),
@@ -27,7 +33,8 @@ KOKORO_SAMPLE_RATE = 24000
 
 # Lazy-load Kokoro to keep startup fast and avoid import crashes when the
 # dependency or model file is missing.
-_kokoro_tts: Optional["KokoroTTS"] = None
+_kokoro_pipeline: Optional["KPipeline"] = None
+_kokoro_model: Optional["KModel"] = None
 
 print("Initializing pyttsx3 fallback TTS engine...")
 tts_engine = pyttsx3.init(driverName="nsss")  # macOS driver; adjust if needed
@@ -45,50 +52,119 @@ def _convert_aiff_to_wav_bytes(aiff_path: str) -> bytes:
     return buffer.getvalue()
 
 
-def _load_kokoro() -> Optional["KokoroTTS"]:
-    global _kokoro_tts
-    if _kokoro_tts or KokoroTTS is None:
-        return _kokoro_tts
+def _load_kokoro() -> Optional["KPipeline"]:
+    """
+    Initialize Kokoro model + pipeline lazily. Requires the `kokoro`
+    package (pip) and a model file; if the file is missing, the package will
+    fetch from HuggingFace by default.
+    """
+    global _kokoro_pipeline, _kokoro_model
 
-    if not os.path.exists(KOKORO_MODEL_PATH):
-        print(
-            f"Kokoro model not found at {KOKORO_MODEL_PATH}. "
-            "Download from https://github.com/hexgrad/Kokoro-TTS/releases "
-            "and set KOKORO_MODEL_PATH."
-        )
-        return None
+    if _kokoro_pipeline or KModel is None or KPipeline is None:
+        if KModel is None or KPipeline is None:
+            print("Kokoro not available (import failed).")
+        return _kokoro_pipeline
 
     try:
         device = os.getenv("KOKORO_DEVICE", "cpu")
-        _kokoro_tts = KokoroTTS(KOKORO_MODEL_PATH, device=device)
+
+        model_path = KOKORO_MODEL_PATH if os.path.exists(KOKORO_MODEL_PATH) else None
+        if model_path is None:
+            print(
+                f"Kokoro model not found at {KOKORO_MODEL_PATH}. "
+                "Will try to download from HuggingFace (hexgrad/Kokoro-82M)."
+            )
+
+        _kokoro_model = KModel(model=model_path)
+        if device and device != "cpu":
+            _kokoro_model = _kokoro_model.to(device)
+
+        _kokoro_pipeline = KPipeline(lang_code="a", model=_kokoro_model, device=device)
         print(f"Kokoro TTS loaded on {device} with voice '{DEFAULT_KOKORO_VOICE}'.")
     except Exception as e:
         print(f"Failed to initialize Kokoro TTS: {e}")
-        _kokoro_tts = None
-    return _kokoro_tts
+        _kokoro_pipeline = None
+        _kokoro_model = None
+
+    return _kokoro_pipeline
+
+
+def _split_text_for_fallback(text: str, max_chars: int = 100) -> list[str]:
+    """
+    Split text into small chunks to keep audio pieces short.
+    Prefer sentence boundaries; further split on commas if needed.
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    chunks: list[str] = []
+
+    def flush(current: str):
+        if current:
+            chunks.append(current.strip())
+
+    current = ""
+    for sent in sentences:
+        if not sent:
+            continue
+        if sent[-1] not in ".!?":
+            sent += "."
+
+        # If the sentence itself is too long, split on commas
+        if len(sent) > max_chars:
+            parts = re.split(r",(?:\s+)?", sent)
+        else:
+            parts = [sent]
+
+        for part in parts:
+            if not part:
+                continue
+            candidate = (current + " " + part).strip() if current else part.strip()
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                flush(current)
+                current = part.strip()
+
+    flush(current)
+    return chunks
+
+
+def preload_tts() -> None:
+    """Warm TTS: try Kokoro load so first request is faster."""
+    try:
+        pipeline = _load_kokoro()
+        if pipeline:
+            print("Kokoro TTS preloaded.")
+        else:
+            print("Kokoro TTS not preloaded (pipeline unavailable).")
+    except Exception as e:
+        print(f"Failed to preload Kokoro TTS: {e}")
 
 
 def _synthesize_with_kokoro(text: str) -> bytes:
     """Primary TTS using local Kokoro (hexgrad/Kokoro-TTS)."""
-    tts = _load_kokoro()
-    if not tts:
+    synth_start = perf_counter()
+    pipeline = _load_kokoro()
+    if not pipeline:
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"Skipping Kokoro; not initialized (took {elapsed:.1f} ms).")
         return b""
 
     try:
-        audio = tts(text, voice=DEFAULT_KOKORO_VOICE)
+        audio_chunks = []
+        # KPipeline returns a generator of Result objects; each has .audio
+        for res in pipeline(text, voice=DEFAULT_KOKORO_VOICE, model=_kokoro_model):
+            if res.audio is None:
+                continue
+            audio_np = res.audio.detach().cpu().numpy().astype(np.float32)
+            audio_chunks.append(audio_np)
 
-        # Kokoro may return (audio, sample_rate) or just audio.
-        sample_rate = getattr(tts, "sample_rate", KOKORO_SAMPLE_RATE)
-        if isinstance(audio, Tuple) or isinstance(audio, list):
-            # handle (audio, sr)
-            if len(audio) == 2:
-                audio, sample_rate = audio
-
-        if audio is None:
+        if not audio_chunks:
+            print("Kokoro produced no audio.")
             return b""
 
-        # Ensure float32 numpy array
-        audio_np = np.array(audio, dtype=np.float32).flatten()
+        audio_np = np.concatenate(audio_chunks)
+        sample_rate = getattr(pipeline.model, "sample_rate", KOKORO_SAMPLE_RATE)
+
         # Convert to 16-bit PCM bytes
         pcm16 = np.clip(audio_np, -1.0, 1.0)
         pcm16 = (pcm16 * 32767).astype(np.int16)
@@ -102,14 +178,49 @@ def _synthesize_with_kokoro(text: str) -> bytes:
         seg = seg.set_frame_rate(16000).set_channels(1)
         buf = io.BytesIO()
         seg.export(buf, format="wav")
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"Kokoro synthesis took {elapsed:.1f} ms.")
         return buf.getvalue()
     except Exception as e:
-        print(f"Kokoro synthesis failed: {e}")
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"Kokoro synthesis failed after {elapsed:.1f} ms: {e}")
         return b""
+
+
+def _stream_with_kokoro(text: str) -> Generator[bytes, None, None]:
+    """
+    Stream Kokoro audio chunks as they are produced.
+    Falls back to empty iterator if Kokoro is unavailable.
+    """
+    pipeline = _load_kokoro()
+    if not pipeline:
+        return
+
+    try:
+        for res in pipeline(text, voice=DEFAULT_KOKORO_VOICE, model=_kokoro_model):
+            if res.audio is None:
+                continue
+            audio_np = res.audio.detach().cpu().numpy().astype(np.float32)
+            pcm16 = np.clip(audio_np, -1.0, 1.0)
+            pcm16 = (pcm16 * 32767).astype(np.int16)
+            seg = AudioSegment(
+                pcm16.tobytes(),
+                frame_rate=getattr(pipeline.model, "sample_rate", KOKORO_SAMPLE_RATE),
+                sample_width=2,
+                channels=1,
+            )
+            seg = seg.set_frame_rate(16000).set_channels(1)
+            buf = io.BytesIO()
+            seg.export(buf, format="wav")
+            yield buf.getvalue()
+    except Exception as e:
+        print(f"Kokoro streaming failed: {e}")
+        return
 
 
 def _synthesize_with_say(text: str) -> bytes:
     """Use macOS 'say' for more natural, fast synthesis."""
+    synth_start = perf_counter()
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
@@ -121,7 +232,6 @@ def _synthesize_with_say(text: str) -> bytes:
             DEFAULT_MAC_VOICE,
             "-o",
             tmp_path,
-            "--data-format=LEI16@16000",  # little-endian 16kHz PCM
             text,
         ]
         completed = subprocess.run(
@@ -135,9 +245,13 @@ def _synthesize_with_say(text: str) -> bytes:
             print("No audio produced by 'say'.")
             return b""
 
-        return _convert_aiff_to_wav_bytes(tmp_path)
+        audio_bytes = _convert_aiff_to_wav_bytes(tmp_path)
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"'say' synthesis took {elapsed:.1f} ms.")
+        return audio_bytes
     except Exception as e:
-        print(f"Error during 'say' synthesis: {e}")
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"Error during 'say' synthesis after {elapsed:.1f} ms: {e}")
         return b""
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -149,6 +263,7 @@ def _synthesize_with_say(text: str) -> bytes:
 
 def _synthesize_with_pyttsx3(text: str) -> bytes:
     """Fallback TTS using pyttsx3."""
+    synth_start = perf_counter()
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
@@ -161,9 +276,13 @@ def _synthesize_with_pyttsx3(text: str) -> bytes:
             print("pyttsx3 produced no audio.")
             return b""
 
-        return _convert_aiff_to_wav_bytes(tmp_path)
+        audio_bytes = _convert_aiff_to_wav_bytes(tmp_path)
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"pyttsx3 synthesis took {elapsed:.1f} ms.")
+        return audio_bytes
     except Exception as e:
-        print(f"Error during pyttsx3 synthesis: {e}")
+        elapsed = (perf_counter() - synth_start) * 1000
+        print(f"Error during pyttsx3 synthesis after {elapsed:.1f} ms: {e}")
         return b""
     finally:
         if tmp_path and os.path.exists(tmp_path):
@@ -184,16 +303,77 @@ def synthesize_speech(text: str) -> bytes:
     if not text or not text.strip():
         return b""
 
+    total_start = perf_counter()
+    path_used = "kokoro"
+
     audio_bytes = _synthesize_with_kokoro(text)
     if audio_bytes:
+        total_ms = (perf_counter() - total_start) * 1000
+        print(f"TTS total (path={path_used}) took {total_ms:.1f} ms.")
         return audio_bytes
 
+    path_used = "say"
     audio_bytes = _synthesize_with_say(text)
     if audio_bytes:
+        total_ms = (perf_counter() - total_start) * 1000
+        print(f"TTS total (path={path_used}) took {total_ms:.1f} ms.")
         return audio_bytes
 
     print("Falling back to pyttsx3 TTS...")
-    return _synthesize_with_pyttsx3(text)
+    path_used = "pyttsx3"
+    audio_bytes = _synthesize_with_pyttsx3(text)
+    total_ms = (perf_counter() - total_start) * 1000
+    print(f"TTS total (path={path_used}) took {total_ms:.1f} ms.")
+    return audio_bytes
+
+
+def stream_speech(text: str) -> Generator[bytes, None, None]:
+    """
+    Stream synthesized speech in small chunks.
+
+    Primary: Kokoro streaming. Fallbacks chunk text and synthesize per chunk.
+    Yields WAV bytes per chunk, already 16kHz mono.
+    """
+    if not text or not text.strip():
+        return
+
+    any_yielded = False
+    parts = _split_text_for_fallback(text)
+
+    for part in parts:
+        part_yielded = False
+
+        # Try Kokoro streaming for this part
+        kokoro_stream = _stream_with_kokoro(part)
+        if kokoro_stream:
+            for chunk in kokoro_stream:
+                if not chunk:
+                    continue
+                part_yielded = True
+                any_yielded = True
+                print(f"Kokoro stream chunk bytes={len(chunk)}")
+                yield chunk
+
+        if part_yielded:
+            continue
+
+        # Fallback per part
+        audio_bytes = _synthesize_with_say(part)
+        if audio_bytes:
+            any_yielded = True
+            print(f"Fallback 'say' chunk bytes={len(audio_bytes)}")
+            yield audio_bytes
+            continue
+
+        print("Fallback 'say' chunk failed; trying pyttsx3.")
+        audio_bytes = _synthesize_with_pyttsx3(part)
+        if audio_bytes:
+            any_yielded = True
+            print(f"Fallback 'pyttsx3' chunk bytes={len(audio_bytes)}")
+            yield audio_bytes
+
+    if not any_yielded:
+        return
 
 if __name__ == '__main__':
     # This is for testing the module directly

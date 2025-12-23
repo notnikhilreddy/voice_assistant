@@ -8,12 +8,10 @@ This project is designed to run on macOS with Apple Silicon (M1/M2/M3) and uses 
 
 - **Real-time Voice Interaction:** Hold down a button to speak, and get a spoken response back.
 - **Web-based Client:** Simple and accessible client that runs in any modern browser.
-- **Dual LLM Architecture:**
-  - **Local:** Uses Microsoft's `Phi-3-mini` for fast, simple queries.
-  - **Remote:** Uses `Llama 3` via the Groq API for complex reasoning.
+- **Remote LLM (Groq):** Streams tokens so speech can start before the full reply is ready.
 - **Local First AI:**
-  - **STT:** Speech-to-Text is handled by `Whisper` running locally via `mlx-whisper`.
-  - **TTS:** Text-to-Speech is handled by `StyleTTS2` running locally.
+  - **STT:** Speech-to-Text via Fun-ASR (MLX) running locally.
+  - **TTS:** Text-to-Speech via Kokoro/`say`/pyttsx3 locally.
 
 ## Setup Instructions
 
@@ -83,6 +81,15 @@ The application uses the Groq API for complex questions. You will need an API ke
    - Your browser will likely ask for permission to use your microphone. Please allow it.
    - Speak your query.
    - Release the button when you are finished.
-   - The server will process your speech, generate a response, and play it back through your browser.
+   - The server will process your speech, stream the LLM reply, and play audio chunks through your browser as they are synthesized.
+
+## Client-streaming message types
+
+- `user_text`: final transcription.
+- `llm_partial`: growing assistant text as tokens stream.
+- `llm_chunk`: text chunk that was just sent to TTS (optional for display).
+- `audio_chunk`: base64 WAV chunk; play in arrival order.
+- `stream_done`: final assistant text; marks end of this turn.
+- `error`: message if something went wrong.
 
 Enjoy your private, locally-run voice assistant!
