@@ -201,8 +201,8 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (message.type === 'audio_chunk') {
                 // Streaming audio chunks; may include a final marker.
                 if (message.data) {
-                    statusDiv.textContent = "Playing response...";
-                    enqueueAudioBase64(message.data);
+                statusDiv.textContent = "Playing response...";
+                enqueueAudioBase64(message.data);
                 }
                 if (message.final) {
                     statusDiv.textContent = "Ready to speak";

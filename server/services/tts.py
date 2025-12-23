@@ -89,9 +89,9 @@ def _load_kokoro() -> Optional["KPipeline"]:
     return _kokoro_pipeline
 
 
-def _split_text_for_fallback(text: str, max_chars: int = 100) -> list[str]:
+def _split_text_for_fallback(text: str, max_first: int = 80, max_rest: int = 120) -> list[str]:
     """
-    Split text into small chunks to keep audio pieces short.
+    Split text into small chunks, biasing the first chunk to be very short.
     Prefer sentence boundaries; further split on commas if needed.
     """
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -102,27 +102,31 @@ def _split_text_for_fallback(text: str, max_chars: int = 100) -> list[str]:
             chunks.append(current.strip())
 
     current = ""
+    is_first = True
     for sent in sentences:
         if not sent:
             continue
         if sent[-1] not in ".!?":
             sent += "."
 
+        limit = max_first if is_first else max_rest
+
         # If the sentence itself is too long, split on commas
-        if len(sent) > max_chars:
-            parts = re.split(r",(?:\s+)?", sent)
-        else:
-            parts = [sent]
+        parts = re.split(r",(?:\s+)?", sent)
 
         for part in parts:
             if not part:
                 continue
             candidate = (current + " " + part).strip() if current else part.strip()
-            if len(candidate) <= max_chars:
+            if len(candidate) <= limit:
                 current = candidate
             else:
                 flush(current)
                 current = part.strip()
+
+        flush(current)
+        current = ""
+        is_first = False
 
     flush(current)
     return chunks

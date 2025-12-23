@@ -111,7 +111,7 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         print(
             f"STT [{backend_name}] (ms): decode+resample={decode_ms:.1f}, asr={asr_ms:.1f}, total={total_ms:.1f}"
         )
-
+        
         return text
     except Exception as e:
         print(f"Error during transcription: {e}")
