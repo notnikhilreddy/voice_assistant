@@ -20,10 +20,8 @@ except Exception as e:
     KModel = None
     KPipeline = None
 
-# macOS built-in "say" produces natural voices and remains a fallback.
-# Kokoro is the new primary local TTS.
-SAY_BIN = "/usr/bin/say"
-DEFAULT_MAC_VOICE = os.getenv("MAC_TTS_VOICE", "Samantha")
+# Kokoro is the primary local TTS.
+# Note: macOS "say" command removed for Linux compatibility
 DEFAULT_KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_MODEL_PATH = os.getenv(
     "KOKORO_MODEL_PATH",
@@ -37,14 +35,25 @@ _kokoro_pipeline: Optional["KPipeline"] = None
 _kokoro_model: Optional["KModel"] = None
 
 print("Initializing pyttsx3 fallback TTS engine...")
-tts_engine = pyttsx3.init(driverName="nsss")  # macOS driver; adjust if needed
-tts_engine.setProperty("rate", 190)
-print("TTS fallback ready.")
+tts_engine = None
+try:
+    # Try to initialize with available driver (Linux: espeak, Windows: sapi5)
+    tts_engine = pyttsx3.init()
+    # Try to set properties, but don't fail if voice setting fails
+    try:
+        tts_engine.setProperty("rate", 190)
+    except Exception:
+        pass  # Rate setting is optional
+    print("TTS fallback ready.")
+except Exception as e:
+    # pyttsx3 is just a fallback; Kokoro is the primary TTS
+    print(f"pyttsx3 fallback not available (this is OK, Kokoro is primary): {e}")
+    tts_engine = None
 
 
-def _convert_aiff_to_wav_bytes(aiff_path: str) -> bytes:
-    """Convert AIFF (16k mono) to WAV bytes for browser playback."""
-    speech = AudioSegment.from_file(aiff_path)
+def _convert_audio_to_wav_bytes(audio_path: str) -> bytes:
+    """Convert audio file (16k mono) to WAV bytes for browser playback."""
+    speech = AudioSegment.from_file(audio_path)
     speech = speech.set_frame_rate(16000).set_channels(1)
 
     buffer = io.BytesIO()
@@ -66,7 +75,10 @@ def _load_kokoro() -> Optional["KPipeline"]:
         return _kokoro_pipeline
 
     try:
-        device = os.getenv("KOKORO_DEVICE", "cpu")
+        # Use CUDA if available, otherwise CPU
+        import torch
+        import warnings
+        device = os.getenv("KOKORO_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
         model_path = KOKORO_MODEL_PATH if os.path.exists(KOKORO_MODEL_PATH) else None
         if model_path is None:
@@ -74,12 +86,20 @@ def _load_kokoro() -> Optional["KPipeline"]:
                 f"Kokoro model not found at {KOKORO_MODEL_PATH}. "
                 "Will try to download from HuggingFace (hexgrad/Kokoro-82M)."
             )
-
-        _kokoro_model = KModel(model=model_path)
+            # Suppress warnings from Kokoro library about repo_id
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*repo_id.*")
+                # Explicitly pass repo_id to suppress warning
+                _kokoro_model = KModel(repo_id="hexgrad/Kokoro-82M")
+        else:
+            _kokoro_model = KModel(model=model_path)
         if device and device != "cpu":
             _kokoro_model = _kokoro_model.to(device)
 
-        _kokoro_pipeline = KPipeline(lang_code="a", model=_kokoro_model, device=device)
+        # Suppress warnings when creating pipeline
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*repo_id.*")
+            _kokoro_pipeline = KPipeline(lang_code="a", model=_kokoro_model, device=device)
         print(f"Kokoro TTS loaded on {device} with voice '{DEFAULT_KOKORO_VOICE}'.")
     except Exception as e:
         print(f"Failed to initialize Kokoro TTS: {e}")
@@ -223,54 +243,22 @@ def _stream_with_kokoro(text: str) -> Generator[bytes, None, None]:
 
 
 def _synthesize_with_say(text: str) -> bytes:
-    """Use macOS 'say' for more natural, fast synthesis."""
-    synth_start = perf_counter()
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
-            tmp_path = tmp.name
-
-        cmd = [
-            SAY_BIN,
-            "-v",
-            DEFAULT_MAC_VOICE,
-            "-o",
-            tmp_path,
-            text,
-        ]
-        completed = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15
-        )
-        if completed.returncode != 0:
-            print(f"'say' failed: {completed.stderr.strip()}")
-            return b""
-
-        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
-            print("No audio produced by 'say'.")
-            return b""
-
-        audio_bytes = _convert_aiff_to_wav_bytes(tmp_path)
-        elapsed = (perf_counter() - synth_start) * 1000
-        print(f"'say' synthesis took {elapsed:.1f} ms.")
-        return audio_bytes
-    except Exception as e:
-        elapsed = (perf_counter() - synth_start) * 1000
-        print(f"Error during 'say' synthesis after {elapsed:.1f} ms: {e}")
-        return b""
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+    """Fallback: Not available on Linux (macOS-only)."""
+    print("macOS 'say' command not available on Linux.")
+    return b""
 
 
 def _synthesize_with_pyttsx3(text: str) -> bytes:
     """Fallback TTS using pyttsx3."""
+    if tts_engine is None:
+        print("pyttsx3 engine not available.")
+        return b""
+    
     synth_start = perf_counter()
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
+        # Use .wav instead of .aiff for Linux compatibility
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
 
         tts_engine.save_to_file(text, tmp_path)
@@ -280,7 +268,17 @@ def _synthesize_with_pyttsx3(text: str) -> bytes:
             print("pyttsx3 produced no audio.")
             return b""
 
-        audio_bytes = _convert_aiff_to_wav_bytes(tmp_path)
+        # Read WAV file directly (no conversion needed)
+        with open(tmp_path, "rb") as f:
+            audio_bytes = f.read()
+        
+        # Convert to 16kHz mono if needed
+        speech = AudioSegment.from_file(tmp_path)
+        speech = speech.set_frame_rate(16000).set_channels(1)
+        buffer = io.BytesIO()
+        speech.export(buffer, format="wav")
+        audio_bytes = buffer.getvalue()
+        
         elapsed = (perf_counter() - synth_start) * 1000
         print(f"pyttsx3 synthesis took {elapsed:.1f} ms.")
         return audio_bytes
@@ -301,7 +299,7 @@ def synthesize_speech(text: str) -> bytes:
     Synthesizes speech from text.
 
     Primary: Kokoro (hexgrad/Kokoro-TTS) for fast local neural TTS.
-    Fallbacks: macOS 'say', then pyttsx3.
+    Fallback: pyttsx3.
     Returns WAV bytes normalized to 16kHz mono for browser playback.
     """
     if not text or not text.strip():
@@ -311,13 +309,6 @@ def synthesize_speech(text: str) -> bytes:
     path_used = "kokoro"
 
     audio_bytes = _synthesize_with_kokoro(text)
-    if audio_bytes:
-        total_ms = (perf_counter() - total_start) * 1000
-        print(f"TTS total (path={path_used}) took {total_ms:.1f} ms.")
-        return audio_bytes
-
-    path_used = "say"
-    audio_bytes = _synthesize_with_say(text)
     if audio_bytes:
         total_ms = (perf_counter() - total_start) * 1000
         print(f"TTS total (path={path_used}) took {total_ms:.1f} ms.")
@@ -362,14 +353,7 @@ def stream_speech(text: str) -> Generator[bytes, None, None]:
             continue
 
         # Fallback per part
-        audio_bytes = _synthesize_with_say(part)
-        if audio_bytes:
-            any_yielded = True
-            print(f"Fallback 'say' chunk bytes={len(audio_bytes)}")
-            yield audio_bytes
-            continue
-
-        print("Fallback 'say' chunk failed; trying pyttsx3.")
+        print("Fallback: trying pyttsx3.")
         audio_bytes = _synthesize_with_pyttsx3(part)
         if audio_bytes:
             any_yielded = True

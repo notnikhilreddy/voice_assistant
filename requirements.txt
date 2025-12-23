@@ -4,16 +4,18 @@ uvicorn[standard]
 websockets
 
 # AI/ML - General
+# Note: Install PyTorch with CUDA support from https://pytorch.org/
+# For CUDA 12.x: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 torch
 transformers
 sentencepiece
 python-dotenv
 soundfile
 
-# STT (Speech-to-Text)
-mlx-whisper
+# STT (Speech-to-Text) - Using PyTorch/Transformers with CUDA
 pydub
 numpy
+librosa
 
 # TTS (Text-to-Speech)
 styletts2
@@ -21,5 +23,4 @@ pyttsx3
 kokoro
 
 # LLM (Language Models)
-mlx-lm
 groq

@@ -4,6 +4,7 @@ torch.serialization.add_safe_globals([getattr])
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
@@ -11,11 +12,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from .services import stt, tts, llm
+from .services.sentence_splitter import detect_complete_sentences
 
 app = FastAPI()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_CLIENT_DIR = BASE_DIR / "web_client"
+
+# Thread pool executor for CPU-bound TTS operations
+tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts")
 
 
 @app.on_event("startup")
@@ -93,93 +98,148 @@ async def websocket_endpoint(websocket: WebSocket):
                 continue
             
             await websocket.send_json({"type": "user_text", "data": user_text})
-            # Yield to the event loop so the client sees the user text before we block on LLM/TTS.
-            await asyncio.sleep(0)
+            await asyncio.sleep(0)  # Yield to event loop
 
-
-            # 2. Get a response from the language model
+            # 2. Stream LLM response with sentence detection and concurrent TTS
             llm_start = perf_counter()
-            llm_response_text = llm.get_llm_response(user_text, history=conversation_history[-12:])
+            llm_response_text = ""
+            sentence_buffer = ""
+            first_audio_ms = None
+            first_sentence_ms = None
+            audio_chunk_count = 0
+            sentence_count = 0
+            
+            # Queue for sentences ready for TTS
+            sentence_queue = asyncio.Queue()
+            tts_tasks = []
+            
+            async def process_sentence_for_tts(sentence: str, sentence_idx: int):
+                """Process a complete sentence through TTS and send audio chunks."""
+                nonlocal first_audio_ms, audio_chunk_count
+                try:
+                    # Run TTS in executor to avoid blocking (TTS is CPU/GPU bound)
+                    # Synthesize speech for this sentence (run in executor for async compatibility)
+                    def synthesize_sentence(s: str):
+                        return list(tts.stream_speech(s))
+                    
+                    audio_chunks = await asyncio.get_event_loop().run_in_executor(
+                        tts_executor,
+                        synthesize_sentence,
+                        sentence
+                    )
+                    
+                    for audio_chunk in audio_chunks:
+                        if not audio_chunk:
+                            continue
+                        audio_chunk_count += 1
+                        if first_audio_ms is None:
+                            first_audio_ms = (perf_counter() - overall_start) * 1000
+                            first_sentence_ms = (perf_counter() - llm_start) * 1000
+                        
+                        audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
+                        await websocket.send_json({
+                            "type": "audio_chunk",
+                            "data": audio_base64,
+                            "sentence_idx": sentence_idx,
+                            "final": False,
+                            "index": audio_chunk_count - 1,
+                        })
+                except Exception as e:
+                    print(f"Error in TTS for sentence {sentence_idx}: {e}")
+            
+            # Stream LLM tokens and detect sentences
+            async for token_chunk in llm.stream_llm_response(user_text, history=conversation_history[-12:]):
+                llm_response_text += token_chunk
+                
+                # Send partial text update to client
+                await websocket.send_json({
+                    "type": "llm_partial",
+                    "data": llm_response_text
+                })
+                
+                # Detect complete sentences
+                complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
+                
+                # Process each complete sentence through TTS concurrently
+                for sentence in complete_sentences:
+                    sentence_count += 1
+                    # Start TTS task for this sentence (non-blocking)
+                    task = asyncio.create_task(process_sentence_for_tts(sentence, sentence_count - 1))
+                    tts_tasks.append(task)
+                    
+                    # Send sentence text to client
+                    await websocket.send_json({
+                        "type": "llm_chunk",
+                        "data": sentence,
+                        "sentence_idx": sentence_count - 1,
+                    })
+            
+            # Wait for all TTS tasks to complete
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks, return_exceptions=True)
+            
             llm_ms = (perf_counter() - llm_start) * 1000
-            await websocket.send_json({"type": "llm_text", "data": llm_response_text})
-            # Update history after we have a successful LLM response.
-            conversation_history.extend(
-                [
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": llm_response_text},
-                ]
-            )
-
-
-            # 3. Synthesize the response to speech (streaming)
-            tts_start = perf_counter()
-            chunk_count = 0
-            first_chunk_ms = None
-            for chunk in tts.stream_speech(llm_response_text):
-                if not chunk:
-                    continue
-                chunk_count += 1
-                if first_chunk_ms is None:
-                    first_chunk_ms = (perf_counter() - overall_start) * 1000
-                audio_base64 = base64.b64encode(chunk).decode("utf-8")
-                await websocket.send_json(
-                    {
-                        "type": "audio_chunk",
-                        "data": audio_base64,
-                        "final": False,
-                        "index": chunk_count - 1,
-                    }
-                )
-
-            if chunk_count == 0:
+            
+            # Process any remaining text in buffer as final sentence
+            if sentence_buffer.strip():
+                sentence_count += 1
+                final_sentence = sentence_buffer.strip()
+                await process_sentence_for_tts(final_sentence, sentence_count - 1)
+                await websocket.send_json({
+                    "type": "llm_chunk",
+                    "data": final_sentence,
+                    "sentence_idx": sentence_count - 1,
+                })
+            
+            # Update conversation history
+            conversation_history.extend([
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": llm_response_text},
+            ])
+            
+            # Note: We don't send llm_text here because llm_partial already updated the client
+            # with the complete response. Sending llm_text would create a duplicate.
+            
+            if audio_chunk_count == 0:
                 await websocket.send_json({"type": "error", "message": "Sorry, I had trouble generating a response."})
                 continue
-
-            tts_ms = (perf_counter() - tts_start) * 1000
-            await websocket.send_json(
-                {
-                    "type": "audio_done",
-                    "meta": {
-                        "tts_ms": round(tts_ms, 1),
-                        "chunks": chunk_count,
-                        "first_chunk_ms": round(first_chunk_ms or 0, 1),
-                    },
-                }
-            )
-            await websocket.send_json(
-                {
-                    "type": "stream_done",
-                    "data": llm_response_text,
-                    "meta": {
-                        "tts_ms": round(tts_ms, 1),
-                        "chunks": chunk_count,
-                        "first_chunk_ms": round(first_chunk_ms or 0, 1),
-                    },
-                }
-            )
+            
+            await websocket.send_json({
+                "type": "stream_done",
+                "data": llm_response_text,
+                "meta": {
+                    "sentences": sentence_count,
+                    "audio_chunks": audio_chunk_count,
+                    "first_audio_ms": round(first_audio_ms or 0, 1),
+                    "first_sentence_ms": round(first_sentence_ms or 0, 1),
+                },
+            })
+            
             total_ms = (perf_counter() - overall_start) * 1000
             llm_to_first_ms = (
-                max(0.0, (first_chunk_ms or 0) - stt_ms - llm_ms) if first_chunk_ms is not None else 0.0
+                max(0.0, (first_audio_ms or 0) - stt_ms - llm_ms) if first_audio_ms is not None else 0.0
             )
             timing_payload = {
                 "stt_ms": round(stt_ms, 1),
                 "llm_ms": round(llm_ms, 1),
-                "tts_ms": round(tts_ms, 1),
-                "first_chunk_ms": round(first_chunk_ms or 0, 1),
+                "first_audio_ms": round(first_audio_ms or 0, 1),
+                "first_sentence_ms": round(first_sentence_ms or 0, 1),
                 "llm_to_first_ms": round(llm_to_first_ms, 1),
                 "total_ms": round(total_ms, 1),
+                "sentences": sentence_count,
+                "audio_chunks": audio_chunk_count,
             }
-            # Concise turn log focused on latency to first audio
+            
             print(
                 "[turn] "
                 f"stt={timing_payload['stt_ms']}ms, "
                 f"llm={timing_payload['llm_ms']}ms, "
-                f"first_audio={timing_payload['first_chunk_ms']}ms, "
+                f"first_audio={timing_payload['first_audio_ms']}ms, "
+                f"first_sentence={timing_payload['first_sentence_ms']}ms, "
                 f"llm_to_first={timing_payload['llm_to_first_ms']}ms, "
-                f"tts_total={timing_payload['tts_ms']}ms, "
                 f"total={timing_payload['total_ms']}ms, "
-                f"chunks={chunk_count} | "
-                f"user=\"{user_text}\" | assistant=\"{llm_response_text}\""
+                f"sentences={sentence_count}, chunks={audio_chunk_count} | "
+                f"user=\"{user_text}\" | assistant=\"{llm_response_text[:50]}...\""
             )
             await websocket.send_json({"type": "timing", "data": timing_payload})
 

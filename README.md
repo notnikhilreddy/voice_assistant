@@ -2,7 +2,7 @@
 
 This project is a real-time voice assistant that runs a local AI pipeline for speed and privacy, with the ability to query a powerful remote AI for complex questions. It uses a web interface for capturing and playing back audio.
 
-This project is designed to run on macOS with Apple Silicon (M1/M2/M3) and uses MLX for local AI model acceleration.
+This project is designed to run on Linux with NVIDIA CUDA GPUs and uses PyTorch for local AI model acceleration.
 
 ## Features
 
@@ -10,18 +10,17 @@ This project is designed to run on macOS with Apple Silicon (M1/M2/M3) and uses 
 - **Web-based Client:** Simple and accessible client that runs in any modern browser.
 - **Remote LLM (Groq):** Streams tokens so speech can start before the full reply is ready.
 - **Local First AI:**
-  - **STT:** Speech-to-Text via Fun-ASR (MLX) running locally.
-  - **TTS:** Text-to-Speech via Kokoro/`say`/pyttsx3 locally.
+  - **STT:** Speech-to-Text via Whisper (PyTorch/CUDA) running locally on GPU.
+  - **TTS:** Text-to-Speech via Kokoro/pyttsx3 locally.
 
 ## Setup Instructions
 
 ### 1. Prerequisites
 
 - Python 3.10+
-- `portaudio` for audio processing. You can install it with Homebrew:
-  ```bash
-  brew install portaudio
-  ```
+- NVIDIA GPU with CUDA support (CUDA 12.x recommended)
+- CUDA Toolkit and cuDNN installed
+- PyTorch with CUDA support (see installation instructions below)
 
 ### 2. Clone the Repository
 
@@ -41,11 +40,15 @@ python3 -m venv venv
 # Activate it
 source venv/bin/activate
 
+# Install PyTorch with CUDA support first (adjust CUDA version as needed)
+# For CUDA 12.1:
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 # Install the required packages
 pip install -r requirements.txt
 ```
 
-*Note: The first time you run the application, the AI models (Whisper, StyleTTS2, and Phi-3) will be downloaded. This may take some time and require a significant amount of disk space.*
+*Note: The first time you run the application, the AI models (Whisper, etc.) will be downloaded. This may take some time and require a significant amount of disk space. Make sure your GPU has sufficient VRAM (at least 4GB recommended).*
 
 ### 4. Configure Environment Variables
 

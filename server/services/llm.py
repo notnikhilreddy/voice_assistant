@@ -1,7 +1,8 @@
 import os
+import time
 import asyncio
 from time import perf_counter
-from typing import Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -69,7 +70,7 @@ def query_remote_llm(user_text: str, history: Optional[List[Dict[str, str]]] = N
             print(f"Error querying Groq API attempt {attempt} after {elapsed:.1f} ms: {e}")
 
         if attempt < LLM_MAX_RETRIES:
-            asyncio.sleep(LLM_RETRY_DELAY)
+            time.sleep(LLM_RETRY_DELAY)
 
     print(f"LLM failed after {LLM_MAX_RETRIES} attempts: {last_error}")
     return "Sorry, I couldn’t generate a response right now. Can you rephrase or ask something else?"
@@ -80,6 +81,59 @@ def get_llm_response(prompt: str, history: Optional[List[Dict[str, str]]] = None
     Main function to get a response from the remote Groq LLM.
     """
     return query_remote_llm(prompt, history)
+
+
+async def stream_llm_response(
+    user_text: str, history: Optional[List[Dict[str, str]]] = None
+) -> AsyncGenerator[str, None]:
+    """
+    Stream LLM tokens as they are generated for low-latency responses.
+    Yields text chunks as they arrive from the Groq API.
+    """
+    if not GROQ_API_KEY:
+        yield "Groq API key is not configured. Please set it in the .env file."
+        return
+
+    print("Streaming LLM response (Groq openai/gpt-oss-20b)...")
+    llm_start = perf_counter()
+    last_error = None
+
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            stream = groq_client.chat.completions.create(
+                messages=_build_messages(user_text, history),
+                model="openai/gpt-oss-20b",
+                max_tokens=200,
+                temperature=0.7,
+                stream=True,  # Enable streaming
+            )
+            
+            # Stream tokens as they arrive
+            accumulated_text = ""
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    accumulated_text += content
+                    yield content
+                    # Yield control to event loop periodically for better concurrency
+                    await asyncio.sleep(0)
+            
+            elapsed = (perf_counter() - llm_start) * 1000
+            print(f"LLM stream completed in {elapsed:.1f} ms.")
+            if accumulated_text.strip():
+                return
+            
+            last_error = "Empty LLM response"
+        except Exception as e:
+            last_error = str(e)
+            elapsed = (perf_counter() - llm_start) * 1000
+            print(f"Error streaming Groq API attempt {attempt} after {elapsed:.1f} ms: {e}")
+
+        if attempt < LLM_MAX_RETRIES:
+            await asyncio.sleep(LLM_RETRY_DELAY)
+
+    print(f"LLM streaming failed after {LLM_MAX_RETRIES} attempts: {last_error}")
+    yield "Sorry, I couldn't generate a response right now. Can you rephrase or ask something else?"
 
 
 if __name__ == '__main__':
