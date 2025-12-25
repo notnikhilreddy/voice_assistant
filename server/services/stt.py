@@ -1,5 +1,9 @@
 import os
 from io import BytesIO
+import tempfile
+import wave
+import warnings
+import sys
 from time import perf_counter
 from typing import Optional
 
@@ -16,7 +20,21 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"STT using device: {DEVICE}")
 
 # Backend selection: "whisper" (default) or "funasr"
-STT_BACKEND = os.getenv("STT_BACKEND", "whisper").lower()
+_DEFAULT_BACKEND = os.getenv(
+    "STT_BACKEND_DEFAULT",
+    "mlx_funasr" if sys.platform == "darwin" else "whisper",
+)
+STT_BACKEND = os.getenv("STT_BACKEND", _DEFAULT_BACKEND).lower()
+STT_FALLBACK_TO_WHISPER = os.getenv("STT_FALLBACK_TO_WHISPER", "1") == "1"
+
+# Silence the most common transformer warnings/log spam.
+warnings.filterwarnings("ignore", message=".*Special tokens have been added.*")
+try:
+    from transformers.utils import logging as hf_logging  # type: ignore
+    hf_logging.set_verbosity_error()
+    hf_logging.disable_progress_bar()
+except Exception:
+    pass
 
 # Whisper (default) - using transformers library with CUDA support
 try:
@@ -41,10 +59,93 @@ except Exception:
     AutoProcessor = None
     AutoModelForSpeechSeq2Seq = None
 
-FUNASR_MODEL_ID = os.getenv("FUNASR_MODEL_ID", "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch")
+# The previous default FunASR model id was invalid/outdated. Keep env override.
+FUNASR_MODEL_ID = os.getenv("FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-fp16")
 _funasr_processor: Optional["AutoProcessor"] = None
 _funasr_model: Optional["AutoModelForSpeechSeq2Seq"] = None
 _funasr_use_fp16 = False
+
+# MLX FunASR (Apple Silicon) - via mlx-audio-plus
+MLX_FUNASR_MODEL_ID = os.getenv("MLX_FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-fp16")
+MLX_FUNASR_FALLBACK_MODEL_ID = os.getenv("MLX_FUNASR_FALLBACK_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-8bit")
+_mlx_funasr_model = None
+
+# If the user sets STT_BACKEND=funasr on macOS, treat it as an alias for mlx_funasr.
+# This avoids trying to load MLX model repos through Transformers.
+if sys.platform == "darwin" and STT_BACKEND == "funasr" and os.getenv("PREFER_MLX_FUNASR", "1") == "1":
+    STT_BACKEND = "mlx_funasr"
+    print("STT: funasr -> mlx_funasr (macOS alias)")
+
+# If STT_BACKEND=funasr on other platforms but mlx-audio-plus is installed, prefer MLX
+# (useful for Apple Silicon python environments where sys.platform may still be darwin).
+if STT_BACKEND == "funasr" and os.getenv("PREFER_MLX_FUNASR", "1") == "1":
+    try:
+        import importlib
+
+        importlib.import_module("mlx_audio.stt.models.funasr")
+        STT_BACKEND = "mlx_funasr"
+        print("STT: switching backend funasr -> mlx_funasr (PREFER_MLX_FUNASR=1)")
+    except Exception:
+        pass
+
+
+def _get_mlx_funasr_model():
+    global _mlx_funasr_model
+    if _mlx_funasr_model is None:
+        try:
+            from mlx_audio.stt.models.funasr import Model  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                "mlx-audio-plus is required for mlx_funasr backend. Install it and restart."
+            ) from e
+        # Some mlx-audio-plus versions may not support every model packaging variant.
+        # Try the configured model first, then a known-good fallback.
+        try:
+            print(f"Loading MLX FunASR model: {MLX_FUNASR_MODEL_ID}")
+            _mlx_funasr_model = Model.from_pretrained(MLX_FUNASR_MODEL_ID)
+        except Exception as e1:
+            if MLX_FUNASR_FALLBACK_MODEL_ID and MLX_FUNASR_FALLBACK_MODEL_ID != MLX_FUNASR_MODEL_ID:
+                print(
+                    f"MLX FunASR load failed for {MLX_FUNASR_MODEL_ID}: {e1}. "
+                    f"Trying fallback model {MLX_FUNASR_FALLBACK_MODEL_ID}..."
+                )
+                _mlx_funasr_model = Model.from_pretrained(MLX_FUNASR_FALLBACK_MODEL_ID)
+                # Update model id for logging after successful fallback.
+                globals()["MLX_FUNASR_MODEL_ID"] = MLX_FUNASR_FALLBACK_MODEL_ID
+            else:
+                raise
+    return _mlx_funasr_model
+
+
+def _float32_to_wav_path(audio_f32: np.ndarray, sample_rate: int = 16000) -> str:
+    audio_f32 = np.asarray(audio_f32, dtype=np.float32).reshape(-1)
+    audio_f32 = np.clip(audio_f32, -1.0, 1.0)
+    pcm16 = (audio_f32 * 32767.0).astype(np.int16)
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    with wave.open(tmp_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16.tobytes())
+    return tmp_path
+
+
+def _transcribe_with_mlx_funasr(audio_data: np.ndarray) -> str:
+    model = _get_mlx_funasr_model()
+    wav_path = None
+    try:
+        wav_path = _float32_to_wav_path(audio_data, sample_rate=16000)
+        result = model.generate(wav_path)
+        text = getattr(result, "text", None)
+        return (text or "").strip()
+    finally:
+        if wav_path:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
 
 # Track if model uses FP16
@@ -72,8 +173,11 @@ def _get_funasr_model() -> tuple["AutoProcessor", "AutoModelForSpeechSeq2Seq"]:
         if not FUNASR_AVAILABLE:
             raise RuntimeError("Fun-ASR backend unavailable; install transformers.")
         print(f"Loading Fun-ASR model: {FUNASR_MODEL_ID} on {DEVICE}")
-        _funasr_processor = AutoProcessor.from_pretrained(FUNASR_MODEL_ID)
-        _funasr_model = AutoModelForSpeechSeq2Seq.from_pretrained(FUNASR_MODEL_ID)
+        try:
+            _funasr_processor = AutoProcessor.from_pretrained(FUNASR_MODEL_ID)
+            _funasr_model = AutoModelForSpeechSeq2Seq.from_pretrained(FUNASR_MODEL_ID)
+        except Exception as e:
+            raise RuntimeError(f"Failed to load Fun-ASR model '{FUNASR_MODEL_ID}': {e}") from e
         _funasr_model = _funasr_model.to(DEVICE)
         if DEVICE == "cuda":
             _funasr_model = _funasr_model.half()  # Use FP16 for faster inference on GPU
@@ -171,7 +275,12 @@ def _transcribe_with_funasr(audio_data: np.ndarray) -> str:
 def preload_stt() -> None:
     """Load STT model into memory at startup to avoid first-call latency."""
     try:
-        if STT_BACKEND == "whisper":
+        if STT_BACKEND == "mlx_funasr":
+            _ = _get_mlx_funasr_model()
+            # Warm up with dummy audio
+            _ = _transcribe_with_mlx_funasr(np.zeros(16000, dtype=np.float32))
+            print(f"MLX FunASR backend preloaded ({MLX_FUNASR_MODEL_ID}).")
+        elif STT_BACKEND == "whisper":
             if WhisperProcessor is None or WhisperForConditionalGeneration is None:
                 print("Whisper backend not available; install transformers and librosa to use it.")
             else:
@@ -183,10 +292,18 @@ def preload_stt() -> None:
             if not FUNASR_AVAILABLE:
                 print("Fun-ASR backend not available; install transformers to use it.")
             else:
-                _ = _get_funasr_model()
-                # Warm up with dummy audio
-                _ = _transcribe_with_funasr(np.zeros(16000, dtype=np.float32))
-                print(f"Fun-ASR backend preloaded ({FUNASR_MODEL_ID}) on {DEVICE}.")
+                try:
+                    _ = _get_funasr_model()
+                    _ = _transcribe_with_funasr(np.zeros(16000, dtype=np.float32))
+                    print(f"Fun-ASR backend preloaded ({FUNASR_MODEL_ID}) on {DEVICE}.")
+                except Exception as e:
+                    print(f"Failed to preload Fun-ASR model ({FUNASR_MODEL_ID}): {e}")
+                    if STT_FALLBACK_TO_WHISPER:
+                        print("Falling back to Whisper backend.")
+                        globals()["STT_BACKEND"] = "whisper"
+                        _ = _get_whisper_model()
+                        _ = _transcribe_with_whisper(np.zeros(16000, dtype=np.float32))
+                        print(f"Whisper backend preloaded ({WHISPER_MODEL_ID}) on {DEVICE}.")
     except Exception as e:
         print(f"Failed to preload STT backend '{STT_BACKEND}': {e}")
 
@@ -230,18 +347,47 @@ def transcribe_audio(audio_bytes: bytes) -> str:
             print(f"WARNING: Audio appears to be very quiet (max amplitude: {np.max(np.abs(audio_data)):.6f})")
         print(f"Audio stats: shape={audio_data.shape}, duration={len(audio_data)/16000:.2f}s, max={np.max(np.abs(audio_data)):.4f}, mean={np.mean(np.abs(audio_data)):.4f}")
 
-        # Transcribe with selected backend
+        # Transcribe with selected backend (auto-fallback to Whisper to avoid repeated FunASR load errors)
         asr_start = perf_counter()
-        if STT_BACKEND == "whisper":
-            text = _transcribe_with_whisper(audio_data)
-            backend_name = f"whisper ({WHISPER_MODEL_ID}) [{DEVICE}]"
-        else:
-            text = _transcribe_with_funasr(audio_data)
-            backend_name = f"funasr ({FUNASR_MODEL_ID}) [{DEVICE}]"
+        text = ""
+        backend_name = ""
+        backend_used = STT_BACKEND
+        try:
+            if STT_BACKEND == "mlx_funasr":
+                text = _transcribe_with_mlx_funasr(audio_data)
+                backend_name = f"mlx_funasr ({MLX_FUNASR_MODEL_ID})"
+            elif STT_BACKEND == "whisper":
+                text = _transcribe_with_whisper(audio_data)
+                backend_name = f"whisper ({WHISPER_MODEL_ID}) [{DEVICE}]"
+            else:
+                text = _transcribe_with_funasr(audio_data)
+                backend_name = f"funasr ({FUNASR_MODEL_ID}) [{DEVICE}]"
+        except Exception as e:
+            print(f"Primary STT backend '{STT_BACKEND}' failed: {e}")
+            # If we're not already on MLX, try it next (preferred on Apple Silicon).
+            if STT_BACKEND != "mlx_funasr":
+                try:
+                    globals()["STT_BACKEND"] = "mlx_funasr"
+                    backend_used = "mlx_funasr"
+                    text = _transcribe_with_mlx_funasr(audio_data)
+                    backend_name = f"mlx_funasr ({MLX_FUNASR_MODEL_ID})"
+                except Exception as e_mlx:
+                    print(f"Fallback MLX FunASR failed: {e_mlx}")
+                    text = ""
+
+            if not text and STT_FALLBACK_TO_WHISPER and STT_BACKEND != "whisper":
+                try:
+                    globals()["STT_BACKEND"] = "whisper"  # stop repeated FunASR load spam
+                    backend_used = "whisper"
+                    text = _transcribe_with_whisper(audio_data)
+                    backend_name = f"whisper ({WHISPER_MODEL_ID}) [{DEVICE}]"
+                except Exception as e2:
+                    print(f"Fallback Whisper STT also failed: {e2}")
+                    text = ""
         asr_ms = (perf_counter() - asr_start) * 1000
         total_ms = (perf_counter() - wall_start) * 1000
         print(
-            f"STT [{backend_name}] (ms): decode+resample={decode_ms:.1f}, asr={asr_ms:.1f}, total={total_ms:.1f}"
+            f"STT [{backend_name or backend_used}] (ms): decode+resample={decode_ms:.1f}, asr={asr_ms:.1f}, total={total_ms:.1f}"
         )
         
         return text

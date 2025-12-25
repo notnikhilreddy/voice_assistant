@@ -9,22 +9,30 @@ document.addEventListener("DOMContentLoaded", () => {
 
     let assistantAppended = false;
     let mediaStream = null;
-    let mediaRecorder = null;
-    let audioChunks = [];
-    let audioQueue = [];
-    let isPlaying = false;
-    let websocket;
+    let websocket = null;
 
-    // VAD / barge-in settings
-    let vadEnabled = false;
-    let vadRunning = false;
-    let vadAnalyser = null;
-    let vadData = null;
-    const VAD_THRESHOLD = 0.08; // tweak for sensitivity
-    const VAD_SPEECH_MS = 250;
-    const VAD_SILENCE_MS = 400;
-    let vadSpeechMs = 0;
-    let vadSilenceMs = 0;
+    // Playback ordering state (server provides turn_id/sentence_idx/chunk_idx)
+    let isPlaying = false;
+    let playbackTurnId = null;
+    let expectedSentenceIdx = 0;
+    let expectedChunkIdx = 0;
+    const bufferedAudio = new Map(); // key: "sentence:chunk" -> objectURL
+    const sentenceChunkCounts = new Map(); // sentence_idx -> chunk_count
+
+    // PCM streaming state (20ms frames @ 16kHz)
+    let audioCtx = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let zeroGainNode = null;
+    let streamingEnabled = false;
+    let stopTimer = null;
+    let seq = 0;
+    let inRate = 48000;
+    const outRate = 16000;
+    let resampleT = 0.0;
+    let carry = [];
+
+    const _key = (s, c) => `${s}:${c}`;
 
     const bargeIn = () => {
         if (isPlaying) {
@@ -32,7 +40,14 @@ document.addEventListener("DOMContentLoaded", () => {
             audioPlayer.src = "";
             isPlaying = false;
         }
-        audioQueue = [];
+        for (const url of bufferedAudio.values()) {
+            try { URL.revokeObjectURL(url); } catch (e) {}
+        }
+        bufferedAudio.clear();
+        sentenceChunkCounts.clear();
+        playbackTurnId = null;
+        expectedSentenceIdx = 0;
+        expectedChunkIdx = 0;
     };
 
     const ensureStream = async () => {
@@ -47,31 +62,58 @@ document.addEventListener("DOMContentLoaded", () => {
         return mediaStream;
     };
 
+    const tryAdvanceSentence = () => {
+        const count = sentenceChunkCounts.get(expectedSentenceIdx);
+        if (typeof count === "number" && expectedChunkIdx >= count) {
+            expectedSentenceIdx += 1;
+            expectedChunkIdx = 0;
+        }
+    };
+
     const playNextAudio = () => {
         if (isPlaying) return;
-        const next = audioQueue.shift();
-        if (!next) return;
+        tryAdvanceSentence();
+        const key = _key(expectedSentenceIdx, expectedChunkIdx);
+        const url = bufferedAudio.get(key);
+        if (!url) return;
+        bufferedAudio.delete(key);
         isPlaying = true;
-        audioPlayer.src = next;
-        audioPlayer.play().catch(err => {
-            console.error("Playback error:", err);
-        });
+        audioPlayer.src = url;
+        audioPlayer.play().catch((err) => console.error("Playback error:", err));
     };
 
     audioPlayer.onended = () => {
         isPlaying = false;
-        URL.revokeObjectURL(audioPlayer.src);
+        try { URL.revokeObjectURL(audioPlayer.src); } catch (e) {}
+        expectedChunkIdx += 1;
         playNextAudio();
     };
 
-    const enqueueAudioBase64 = (b64) => {
+    const enqueueAudioBase64 = (turnId, sentenceIdx, chunkIdx, chunkCount, b64) => {
         if (!b64) return;
         const binary = atob(b64);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
         const blob = new Blob([bytes], { type: "audio/wav" });
         const url = URL.createObjectURL(blob);
-        audioQueue.push(url);
+
+        if (turnId !== null && turnId !== undefined) {
+            if (playbackTurnId === null) {
+                playbackTurnId = turnId;
+            } else if (turnId !== playbackTurnId) {
+                bargeIn();
+                playbackTurnId = turnId;
+            }
+        }
+
+        if (typeof sentenceIdx === "number" && typeof chunkIdx === "number") {
+            bufferedAudio.set(_key(sentenceIdx, chunkIdx), url);
+            if (typeof chunkCount === "number") {
+                sentenceChunkCounts.set(sentenceIdx, chunkCount);
+            }
+        } else {
+            bufferedAudio.set(_key(expectedSentenceIdx, expectedChunkIdx), url);
+        }
         playNextAudio();
     };
 
@@ -90,80 +132,106 @@ document.addEventListener("DOMContentLoaded", () => {
         logDiv.appendChild(p);
     };
 
-    const sendBufferedAudio = async () => {
-        if (!audioChunks.length || websocket.readyState !== WebSocket.OPEN) return;
-        const blob = new Blob(audioChunks, { type: audioChunks[0].type || "audio/webm" });
-        const buffer = await blob.arrayBuffer();
-        websocket.send(buffer);
-        websocket.send("END_OF_STREAM");
-        statusDiv.textContent = "Processing...";
-        audioChunks = [];
+    const floatToInt16 = (f) => {
+        const v = Math.max(-1, Math.min(1, f));
+        return v < 0 ? (v * 0x8000) : (v * 0x7fff);
     };
 
-    const stopRecording = () => {
-        if (mediaRecorder && mediaRecorder.state === "recording") {
-            mediaRecorder.stop();
+    const resampleTo16k = (input) => {
+        const ratio = inRate / outRate;
+        const out = [];
+        let t = resampleT;
+        while (t < input.length - 1) {
+            const i = Math.floor(t);
+            const frac = t - i;
+            const s = input[i] * (1 - frac) + input[i + 1] * frac;
+            out.push(s);
+            t += ratio;
         }
+        resampleT = t - (input.length - 1);
+        return out;
     };
 
-    const startRecording = async (reason = "manual") => {
+    const sendPcmFrame = (pcm16Bytes) => {
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) return;
+        const out = new Uint8Array(4 + pcm16Bytes.length);
+        new DataView(out.buffer).setUint32(0, seq >>> 0, true);
+        seq += 1;
+        out.set(pcm16Bytes, 4);
+        websocket.send(out.buffer);
+    };
+
+    const startAudioPipeline = async () => {
         await ensureStream();
-        if (mediaRecorder && mediaRecorder.state === "recording") {
-            return;
+        if (audioCtx) return;
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+        inRate = audioCtx.sampleRate || 48000;
+        sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+        processorNode = audioCtx.createScriptProcessor(4096, 1, 1);
+        zeroGainNode = audioCtx.createGain();
+        zeroGainNode.gain.value = 0.0;
+        carry = [];
+        resampleT = 0.0;
+
+        sourceNode.connect(processorNode);
+        processorNode.connect(zeroGainNode);
+        zeroGainNode.connect(audioCtx.destination);
+
+        processorNode.onaudioprocess = (e) => {
+            if (!streamingEnabled) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const out = resampleTo16k(input);
+            if (!out.length) return;
+            carry = carry.concat(out);
+            while (carry.length >= 320) {
+                const frame = carry.slice(0, 320);
+                carry = carry.slice(320);
+                const pcm16 = new Int16Array(320);
+                for (let i = 0; i < 320; i++) pcm16[i] = floatToInt16(frame[i]);
+                sendPcmFrame(new Uint8Array(pcm16.buffer));
+            }
+        };
+    };
+
+    const stopAudioPipeline = async () => {
+        streamingEnabled = false;
+        if (stopTimer) {
+            clearTimeout(stopTimer);
+            stopTimer = null;
         }
-        audioChunks = [];
-        mediaRecorder = new MediaRecorder(mediaStream);
-        mediaRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) audioChunks.push(event.data);
-        };
-        mediaRecorder.onstop = sendBufferedAudio;
-        mediaRecorder.start();
-        statusDiv.textContent = reason === "vad" ? "Listening..." : "Recording...";
+        try {
+            if (processorNode) processorNode.disconnect();
+            if (sourceNode) sourceNode.disconnect();
+            if (zeroGainNode) zeroGainNode.disconnect();
+        } catch (e) {}
+        processorNode = null;
+        sourceNode = null;
+        zeroGainNode = null;
+        if (audioCtx) {
+            try { await audioCtx.close(); } catch (e) {}
+        }
+        audioCtx = null;
     };
 
-    const startVADLoop = async () => {
-        if (!vadEnabled || vadRunning) return;
-        await ensureStream();
-        const ctx = new AudioContext();
-        const source = ctx.createMediaStreamSource(mediaStream);
-        vadAnalyser = ctx.createAnalyser();
-        vadAnalyser.fftSize = 2048;
-        source.connect(vadAnalyser);
-        vadData = new Uint8Array(vadAnalyser.fftSize);
-        vadRunning = true;
-        const frameMs = (vadAnalyser.fftSize / ctx.sampleRate) * 1000;
+    const startStreaming = async (mode) => {
+        await startAudioPipeline();
+        streamingEnabled = true;
+        if (stopTimer) {
+            clearTimeout(stopTimer);
+            stopTimer = null;
+        }
+        recordButton.classList.add("recording");
+        statusDiv.textContent = mode === "manual" ? "Listening..." : "Auto listening...";
+    };
 
-        const loop = () => {
-            if (!vadEnabled) {
-                vadRunning = false;
-                return;
-            }
-            vadAnalyser.getByteTimeDomainData(vadData);
-            let sum = 0;
-            for (let i = 0; i < vadData.length; i++) {
-                const v = (vadData[i] - 128) / 128;
-                sum += v * v;
-            }
-            const rms = Math.sqrt(sum / vadData.length);
-
-            if (rms > VAD_THRESHOLD) {
-                vadSpeechMs += frameMs;
-                vadSilenceMs = 0;
-                if (vadSpeechMs > VAD_SPEECH_MS) {
-                    bargeIn();
-                    startRecording("vad");
-                }
-            } else {
-                vadSilenceMs += frameMs;
-                vadSpeechMs = 0;
-                if (vadSilenceMs > VAD_SILENCE_MS) {
-                    stopRecording();
-                }
-            }
-
-            requestAnimationFrame(loop);
-        };
-        loop();
+    const stopStreamingSoon = (ms = 700) => {
+        if (autoVADToggle.checked) return; // auto mode stays on
+        if (stopTimer) clearTimeout(stopTimer);
+        stopTimer = setTimeout(async () => {
+            await stopAudioPipeline();
+            recordButton.classList.remove("recording");
+            statusDiv.textContent = "Ready to speak";
+        }, ms);
     };
 
     const connectWebSocket = () => {
@@ -171,7 +239,8 @@ document.addEventListener("DOMContentLoaded", () => {
         websocket = new WebSocket(wsUrl);
 
         websocket.onopen = () => {
-            statusDiv.textContent = "Ready to speak";
+            websocket.send(JSON.stringify({ type: "pcm_stream_start", sample_rate: 16000, frame_ms: 20 }));
+            statusDiv.textContent = "Connected";
         };
 
         websocket.onmessage = (event) => {
@@ -182,48 +251,58 @@ document.addEventListener("DOMContentLoaded", () => {
                 console.error("Failed to parse message", e, event.data);
                 return;
             }
-            
-            if (message.type === 'user_text') {
-                console.log("user_text received", message.data);
+
+            if (message.type === "pcm_stream_ready") {
+                statusDiv.textContent = "Ready to speak";
+                return;
+            }
+
+            if (message.type === "barge_in") {
+                bargeIn();
+                statusDiv.textContent = "Interrupted (you spoke)";
+                return;
+            }
+
+            if (message.type === "turn_state") {
+                if (message.state === "USER_TALKING") statusDiv.textContent = "Listening...";
+                if (message.state === "USER_THINKING") statusDiv.textContent = "Listening (pause)...";
+                if (message.state === "USER_FINISHED") statusDiv.textContent = "Thinking...";
+                return;
+            }
+
+            if (message.type === "user_text") {
                 appendUser(message.data);
                 assistantAppended = false;
-                logDiv.scrollTop = logDiv.scrollHeight;
-            } else if (message.type === 'llm_partial') {
-                // optional partial display: update last assistant node or create one
+            } else if (message.type === "llm_partial") {
                 if (!assistantAppended) {
                     appendAssistant(message.data);
                 } else {
                     const last = logDiv.querySelector("p.llm-text:last-of-type");
                     if (last) last.innerHTML = `<strong>Assistant:</strong> ${message.data}`;
                 }
-            } else if (message.type === 'llm_chunk') {
-                // Optional: could log chunk boundaries; already reflected in llm_partial
-            } else if (message.type === 'audio_chunk') {
-                // Streaming audio chunks; may include a final marker.
+            } else if (message.type === "audio_chunk") {
                 if (message.data) {
-                statusDiv.textContent = "Playing response...";
-                enqueueAudioBase64(message.data);
+                    statusDiv.textContent = "Playing response...";
+                    enqueueAudioBase64(
+                        message.turn_id,
+                        message.sentence_idx,
+                        message.chunk_idx,
+                        message.chunk_count,
+                        message.data
+                    );
                 }
-                if (message.final) {
-                    statusDiv.textContent = "Ready to speak";
+            } else if (message.type === "sentence_done") {
+                if (typeof message.sentence_idx === "number" && typeof message.chunk_count === "number") {
+                    sentenceChunkCounts.set(message.sentence_idx, message.chunk_count);
+                    playNextAudio();
                 }
-            } else if (message.type === 'audio_done') {
+            } else if (message.type === "stream_done") {
+                if (!assistantAppended) appendAssistant(message.data);
                 statusDiv.textContent = "Ready to speak";
-            } else if (message.type === 'stream_done') {
-                if (!assistantAppended) {
-                    appendAssistant(message.data);
-                }
-                statusDiv.textContent = "Ready to speak";
-            } else if (message.type === 'llm_text') {
-                // Backward compatibility with non-streaming
-                appendAssistant(message.data);
-            } else if (message.type === 'audio') {
-                // Backward compatibility with single audio payload
-                statusDiv.textContent = "Playing response...";
-                enqueueAudioBase64(message.data);
-            } else if (message.type === 'error') {
+            } else if (message.type === "error") {
                 statusDiv.textContent = message.message;
             }
+
             logDiv.scrollTop = logDiv.scrollHeight;
         };
 
@@ -239,34 +318,29 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     // Manual hold-to-speak
-    recordButton.addEventListener("mousedown", () => {
+    recordButton.addEventListener("mousedown", async () => {
         bargeIn();
-        startRecording("manual");
+        await startStreaming("manual");
     });
-    recordButton.addEventListener("mouseup", stopRecording);
-    // For mobile
-    recordButton.addEventListener("touchstart", () => {
+    recordButton.addEventListener("mouseup", () => stopStreamingSoon(700));
+    recordButton.addEventListener("touchstart", async () => {
         bargeIn();
-        startRecording("manual");
+        await startStreaming("manual");
     });
-    recordButton.addEventListener("touchend", stopRecording);
+    recordButton.addEventListener("touchend", () => stopStreamingSoon(700));
 
-    // Auto VAD toggle
+    // Auto voice detection (server-side turn-taking)
     autoVADToggle.addEventListener("change", async (e) => {
-        vadEnabled = e.target.checked;
-        if (vadEnabled) {
-            await ensureStream();
-            statusDiv.textContent = "Auto listening (will barge-in if you speak)";
-            startVADLoop();
+        const enabled = e.target.checked;
+        if (enabled) {
+            bargeIn();
+            await startStreaming("auto");
         } else {
-            stopRecording();
-            vadRunning = false;
-            vadSpeechMs = 0;
-            vadSilenceMs = 0;
+            await stopAudioPipeline();
+            recordButton.classList.remove("recording");
+            statusDiv.textContent = "Ready to speak";
         }
     });
 
-
-    // Initial connection
     connectWebSocket();
 });

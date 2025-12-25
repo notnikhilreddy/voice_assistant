@@ -18,9 +18,12 @@ numpy
 librosa
 
 # TTS (Text-to-Speech)
-styletts2
 pyttsx3
 kokoro
 
 # LLM (Language Models)
 groq
+mlx
+mlx-lm
+onnxruntime
+mlx-audio-plus

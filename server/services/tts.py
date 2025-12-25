@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import tempfile
+import contextlib
 from pathlib import Path
 from time import perf_counter
 from typing import Generator, Optional, Tuple
@@ -25,7 +26,8 @@ except Exception as e:
 DEFAULT_KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_bella")
 KOKORO_MODEL_PATH = os.getenv(
     "KOKORO_MODEL_PATH",
-    str(Path(__file__).resolve().parent.parent / "models" / "kokoro-v1_0.pth"),
+    # repo_root/models/kokoro-v1_0.pth (repo_root is two levels above server/services)
+    str(Path(__file__).resolve().parents[2] / "models" / "kokoro-v1_0.pth"),
 )
 KOKORO_SAMPLE_RATE = 24000
 
@@ -80,24 +82,31 @@ def _load_kokoro() -> Optional["KPipeline"]:
         import warnings
         device = os.getenv("KOKORO_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
-        model_path = KOKORO_MODEL_PATH if os.path.exists(KOKORO_MODEL_PATH) else None
+        # If env overrides path incorrectly, but repo-root models/ exists, prefer it.
+        fallback_repo_model = str(Path(__file__).resolve().parents[2] / "models" / "kokoro-v1_0.pth")
+        if not os.path.exists(KOKORO_MODEL_PATH) and os.path.exists(fallback_repo_model):
+            model_path = fallback_repo_model
+        else:
+            model_path = KOKORO_MODEL_PATH if os.path.exists(KOKORO_MODEL_PATH) else None
+
         if model_path is None:
             print(
                 f"Kokoro model not found at {KOKORO_MODEL_PATH}. "
                 "Will try to download from HuggingFace (hexgrad/Kokoro-82M)."
             )
             # Suppress warnings from Kokoro library about repo_id
-            with warnings.catch_warnings():
+            with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 warnings.filterwarnings("ignore", message=".*repo_id.*")
                 # Explicitly pass repo_id to suppress warning
                 _kokoro_model = KModel(repo_id="hexgrad/Kokoro-82M")
         else:
-            _kokoro_model = KModel(model=model_path)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                _kokoro_model = KModel(model=model_path)
         if device and device != "cpu":
             _kokoro_model = _kokoro_model.to(device)
 
         # Suppress warnings when creating pipeline
-        with warnings.catch_warnings():
+        with warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             warnings.filterwarnings("ignore", message=".*repo_id.*")
             _kokoro_pipeline = KPipeline(lang_code="a", model=_kokoro_model, device=device)
         print(f"Kokoro TTS loaded on {device} with voice '{DEFAULT_KOKORO_VOICE}'.")
