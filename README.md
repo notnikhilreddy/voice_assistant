@@ -130,6 +130,7 @@ The server can stream partial `stt_partial` updates (live-updating the â€œYou:â€
 ## Client-streaming message types
 
 - `user_text`: final transcription.
+- `stt_token`: live incremental input text (token/delta streaming; emitted by FunASR MLX when enabled).
 - `llm_partial`: growing assistant text as tokens stream.
 - `llm_chunk`: text chunk that was just sent to TTS (optional for display).
 - `audio_chunk`: base64 WAV chunk; play in arrival order.

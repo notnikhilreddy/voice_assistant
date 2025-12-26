@@ -6,16 +6,48 @@
     <title>Voice Assistant Client</title>
     <style>
         :root {
-            --bg: #0b0f17;
-            --panel: #111827;
-            --panel2: #0f172a;
-            --border: rgba(255,255,255,0.08);
+            --radius: 14px;
+            --border: rgba(255,255,255,0.10);
+            --shadow: 0 18px 60px rgba(0,0,0,0.32);
+
+            --bg0: #070a10;
+            --bg1: #0b1220;
+            --panel0: rgba(17,24,39,0.92);
+            --panel1: rgba(15,23,42,0.74);
+            --panel2: rgba(255,255,255,0.06);
+
             --text: rgba(255,255,255,0.92);
-            --muted: rgba(255,255,255,0.65);
-            --bubble-user: #1f2937;
-            --bubble-assistant: #111827;
-            --accent: #22c55e;
+            --muted: rgba(255,255,255,0.68);
+            --muted2: rgba(255,255,255,0.52);
+
+            --accent: #7c3aed; /* violet */
+            --accent2: #06b6d4; /* cyan */
+            --accent3: #22c55e; /* green */
             --danger: #ef4444;
+
+            --grad: linear-gradient(135deg, rgba(124,58,237,0.95), rgba(6,182,212,0.90));
+            --grad2: linear-gradient(135deg, rgba(34,197,94,0.95), rgba(6,182,212,0.80));
+
+            --bubble-user: rgba(255,255,255,0.08);
+            --bubble-assistant: rgba(255,255,255,0.08);
+        }
+
+        html[data-theme="light"] {
+            --border: rgba(15,23,42,0.14);
+            --shadow: 0 18px 50px rgba(2,6,23,0.12);
+
+            --bg0: #f6f7fb;
+            --bg1: #eef2ff;
+            --panel0: rgba(255,255,255,0.92);
+            --panel1: rgba(255,255,255,0.72);
+            --panel2: rgba(2,6,23,0.06);
+
+            --text: rgba(2,6,23,0.92);
+            --muted: rgba(2,6,23,0.65);
+            --muted2: rgba(2,6,23,0.50);
+
+            --bubble-user: rgba(255,255,255,0.85);
+            --bubble-assistant: rgba(255,255,255,0.85);
         }
 
         * { box-sizing: border-box; }
@@ -23,24 +55,119 @@
         body {
             margin: 0;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background: radial-gradient(1200px 800px at 20% 0%, #0b1220 0%, var(--bg) 55%, #070a10 100%);
+            overflow: hidden; /* Keep sidebar pinned; only internal panes scroll */
+            /* Smooth, blended background (no harsh radial edges) */
+            background:
+                radial-gradient(1400px 1000px at 15% 10%, rgba(124,58,237,0.20) 0%, rgba(124,58,237,0.08) 40%, transparent 72%),
+                radial-gradient(1500px 1100px at 85% 12%, rgba(6,182,212,0.18) 0%, rgba(6,182,212,0.07) 42%, transparent 75%),
+                radial-gradient(1600px 1200px at 40% 92%, rgba(34,197,94,0.14) 0%, rgba(34,197,94,0.06) 40%, transparent 74%),
+                linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 65%, var(--bg0) 100%);
+            background-attachment: fixed;
             color: var(--text);
         }
 
         .app {
-            height: 100%;
+            height: 100vh; /* lock to viewport; internal panes scroll */
             display: grid;
             grid-template-columns: 280px 1fr;
+            min-height: 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 40;
+        }
+        .sidebar-backdrop.active {
+            display: block;
         }
 
         aside {
-            background: rgba(17,24,39,0.9);
+            background: var(--panel0);
             border-right: 1px solid var(--border);
             padding: 14px;
             display: flex;
             flex-direction: column;
             gap: 12px;
+            width: 280px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            position: relative;
+            height: 100vh; /* independent scroll */
+            z-index: 50;
+            transition: transform 0.2s ease-out, opacity 0.2s ease-out;
         }
+
+        @media (max-width: 768px) {
+            .app {
+                grid-template-columns: 1fr;
+            }
+            aside {
+                position: fixed;
+                left: 0;
+                top: 0;
+                bottom: 0;
+                height: 100%;
+                transform: translateX(-100%);
+                opacity: 0;
+                pointer-events: none;
+            }
+            .app:not(.sidebar-hidden) aside {
+                transform: translateX(0);
+                opacity: 1;
+                pointer-events: auto;
+            }
+        }
+
+        @media (min-width: 769px) {
+            .app.sidebar-hidden aside {
+                display: none;
+            }
+            .app.sidebar-hidden {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .sidebar-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .sidebar-actions {
+            display: inline-flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .sidebar-action-btn {
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.06);
+            color: var(--text);
+            border-radius: 10px;
+            padding: 6px 8px;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1;
+            font-weight: 700;
+        }
+        .sidebar-action-btn:hover { background: rgba(255,255,255,0.10); }
+
+        #chatSearch {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.05);
+            color: var(--text);
+            outline: none;
+        }
+        #chatSearch::placeholder { color: var(--muted2); }
 
         .brand {
             font-weight: 700;
@@ -50,24 +177,45 @@
             text-transform: uppercase;
         }
 
+        .sidebar-section-title {
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+        }
+
+        .sidebar-footnote {
+            color: var(--muted2);
+            font-size: 12px;
+            padding: 4px 2px;
+        }
+
         #newChatButton {
             width: 100%;
-            background: rgba(255,255,255,0.06);
+            background: var(--panel2);
             color: var(--text);
             border: 1px solid var(--border);
-            border-radius: 10px;
+            border-radius: 12px;
             padding: 10px 12px;
             cursor: pointer;
             font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
         }
-        #newChatButton:hover { background: rgba(255,255,255,0.09); }
+        #newChatButton:hover { filter: brightness(1.05); }
 
         #conversationList {
             list-style: none;
             padding: 0;
             margin: 0;
             overflow-y: auto;
-            flex: 1;
+            overflow-x: hidden;
+            flex: 1 1 auto;
+            min-height: 0;
+            display: block;
+            visibility: visible;
         }
 
         .conv-item {
@@ -79,6 +227,7 @@
             display: flex;
             flex-direction: column;
             gap: 4px;
+            position: relative;
         }
         .conv-item:hover { background: rgba(255,255,255,0.06); }
         .conv-item.active {
@@ -95,39 +244,141 @@
         }
         .conv-sub {
             font-size: 12px;
-            color: rgba(255,255,255,0.55);
+            color: var(--muted2);
             overflow: hidden;
             white-space: nowrap;
             text-overflow: ellipsis;
         }
 
+        .conv-actions {
+            position: absolute;
+            right: 6px;
+            top: 6px;
+            display: flex;
+            gap: 6px;
+            opacity: 0.85;
+        }
+        .conv-item:hover .conv-actions { opacity: 1.0; }
+        .icon-btn {
+            border: 1px solid var(--border);
+            background: var(--panel2);
+            color: var(--muted);
+            border-radius: 8px;
+            padding: 4px 6px;
+            cursor: pointer;
+            font-size: 12px;
+            line-height: 1;
+        }
+        .icon-btn:hover { filter: brightness(1.06); }
+
         main {
             display: grid;
             grid-template-rows: auto 1fr auto;
             min-width: 0;
+            height: 100vh; /* ensure #log pane is the scroller */
+            overflow: hidden;
         }
 
         header {
             padding: 14px 18px;
             border-bottom: 1px solid var(--border);
-            background: rgba(15,23,42,0.6);
+            background: var(--panel1);
             display: flex;
             align-items: center;
             justify-content: space-between;
             gap: 12px;
         }
-        .header-title { font-weight: 700; }
+        .header-left {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            min-width: 0;
+        }
+        .sidebar-toggle {
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 6px 8px;
+            cursor: pointer;
+            color: var(--text);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+        .sidebar-toggle:hover {
+            background: var(--panel2);
+        }
+        .header-title { font-weight: 800; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         #status { color: var(--muted); font-size: 13px; }
+
+        .header-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .ghost-btn {
+            border: 1px solid var(--border);
+            background: var(--panel2);
+            color: var(--text);
+            border-radius: 12px;
+            padding: 8px 10px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+            font-size: 13px;
+        }
+        .ghost-btn:hover { filter: brightness(1.05); }
+
+        .icon {
+            width: 16px;
+            height: 16px;
+            display: inline-block;
+        }
 
         #log {
             padding: 24px 18px 24px;
             overflow-y: auto;
+            overscroll-behavior: contain;
+            scroll-behavior: smooth;
+        }
+
+        .empty {
+            height: 100%;
+            display: grid;
+            place-items: center;
+            padding: 40px 14px;
+            color: var(--muted);
+            text-align: center;
+        }
+        .empty-card {
+            max-width: 540px;
+            width: 100%;
+            background: var(--panel1);
+            border: 1px solid var(--border);
+            border-radius: calc(var(--radius) + 2px);
+            box-shadow: var(--shadow);
+            padding: 22px 18px;
+        }
+        .empty-title {
+            font-weight: 900;
+            font-size: 18px;
+            color: var(--text);
+            margin: 10px 0 6px;
+        }
+        .empty-sub {
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.4;
         }
 
         .msg-row {
             display: flex;
             margin: 10px 0;
             gap: 10px;
+            align-items: flex-end;
         }
         .msg-row.user { justify-content: flex-end; }
         .msg-row.assistant { justify-content: flex-start; }
@@ -139,19 +390,77 @@
             line-height: 1.35;
             white-space: pre-wrap;
             word-wrap: break-word;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.12);
         }
-        .msg-row.user .msg-bubble { background: rgba(31,41,55,0.92); }
-        .msg-row.assistant .msg-bubble { background: rgba(17,24,39,0.85); }
+        .msg-row.user .msg-bubble { background: var(--bubble-user); }
+        .msg-row.assistant .msg-bubble { background: var(--bubble-assistant); }
+
+        .avatar {
+            width: 30px;
+            height: 30px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            display: grid;
+            place-items: center;
+            flex: 0 0 auto;
+            overflow: hidden;
+        }
+        .avatar.user {
+            background: var(--grad2);
+            color: rgba(2,6,23,0.9);
+            font-weight: 900;
+        }
+        .avatar.assistant {
+            background: var(--grad);
+            color: rgba(255,255,255,0.92);
+            font-weight: 900;
+        }
 
         .composer {
             border-top: 1px solid var(--border);
-            background: rgba(15,23,42,0.65);
+            background: var(--panel1);
             padding: 14px 18px;
             display: flex;
             align-items: center;
             gap: 12px;
             flex-wrap: wrap;
         }
+
+        .input-wrap {
+            flex: 1;
+            min-width: 280px;
+            display: flex;
+            align-items: stretch;
+            gap: 10px;
+        }
+
+        #textInput {
+            flex: 1;
+            resize: none;
+            min-height: 44px;
+            max-height: 140px;
+            padding: 10px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--panel2);
+            color: var(--text);
+            outline: none;
+            line-height: 1.35;
+        }
+        #textInput::placeholder { color: var(--muted2); }
+
+        #sendButton {
+            background: var(--grad);
+            color: rgba(255,255,255,0.96);
+            border: 0;
+            border-radius: 12px;
+            padding: 10px 14px;
+            cursor: pointer;
+            font-weight: 700;
+            min-width: 72px;
+            box-shadow: 0 12px 34px rgba(124,58,237,0.20);
+        }
+        #sendButton:hover { filter: brightness(1.05); }
 
         .toggle {
             display: inline-flex;
@@ -163,16 +472,17 @@
         }
 
         #recordButton {
-            background-color: var(--accent);
-            color: #06220f;
+            background: var(--grad2);
+            color: rgba(2,6,23,0.90);
             border: none;
             padding: 12px 16px;
             border-radius: 12px;
             font-size: 14px;
             font-weight: 700;
             cursor: pointer;
+            box-shadow: 0 12px 34px rgba(34,197,94,0.14);
         }
-        #recordButton.recording { background-color: var(--danger); color: #220707; }
+        #recordButton.recording { background: linear-gradient(135deg, rgba(239,68,68,0.95), rgba(249,115,22,0.88)); color: rgba(34,7,7,0.96); }
         #recordButton:hover { filter: brightness(1.05); }
 
         .hint {
@@ -181,23 +491,125 @@
             color: rgba(255,255,255,0.55);
             font-size: 12px;
         }
+
+        html[data-theme="light"] .hint { color: rgba(2,6,23,0.55); }
+
+        /* Settings modal */
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 18px;
+            z-index: 50;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal {
+            width: min(560px, 100%);
+            background: var(--panel0);
+            border: 1px solid var(--border);
+            border-radius: calc(var(--radius) + 4px);
+            box-shadow: var(--shadow);
+            padding: 16px;
+        }
+        .modal-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .modal-title {
+            font-weight: 900;
+            font-size: 16px;
+        }
+        .modal-body {
+            display: grid;
+            gap: 10px;
+        }
+        .setting-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--panel2);
+        }
+        .setting-label {
+            display: grid;
+            gap: 2px;
+        }
+        .setting-label b { font-size: 13px; }
+        .setting-label span { font-size: 12px; color: var(--muted2); }
+        .switch {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 13px;
+            user-select: none;
+        }
     </style>
 </head>
 <body>
-    <div class="app">
+    <div class="app" id="appContainer">
+        <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
         <aside>
-            <div class="brand">Voice Assistant</div>
-            <button id="newChatButton">New chat</button>
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+                <div class="brand">Voice Assistant</div>
+                <button id="sidebarClose" class="sidebar-toggle" style="display: none;" title="Close sidebar" aria-label="Close sidebar">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none">
+                        <path d="M6 18L18 6M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
+            <button id="newChatButton">
+                <svg class="icon" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+                New chat
+            </button>
+            <div style="position: relative;">
+                <input id="chatSearch" placeholder="Search chats" />
+            </div>
+            <div class="sidebar-row" style="padding: 2px 2px 0;">
+                <div class="sidebar-section-title">Chat history</div>
+                <div class="sidebar-actions">
+                    <button id="renameChatButton" class="sidebar-action-btn" title="Rename current chat">Rename</button>
+                    <button id="deleteChatButton" class="sidebar-action-btn" title="Delete current chat">Delete</button>
+                </div>
+            </div>
             <ul id="conversationList"></ul>
-            <div style="color: rgba(255,255,255,0.45); font-size: 12px; padding: 4px 2px;">
+            <div class="sidebar-footnote">
                 Conversations are stored in this browser.
             </div>
+            <button id="settingsButton" class="ghost-btn" style="width:100%; justify-content:center;">
+                <svg class="icon" viewBox="0 0 24 24" fill="none">
+                    <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" stroke="currentColor" stroke-width="2"/>
+                    <path d="M19.4 15a7.9 7.9 0 0 0 .1-2l2-1.5-2-3.5-2.4 1a8.4 8.4 0 0 0-1.7-1l-.3-2.6H10l-.3 2.6a8.4 8.4 0 0 0-1.7 1l-2.4-1-2 3.5 2 1.5a7.9 7.9 0 0 0 .1 2l-2 1.5 2 3.5 2.4-1a8.4 8.4 0 0 0 1.7 1l.3 2.6h4.8l.3-2.6a8.4 8.4 0 0 0 1.7-1l2.4 1 2-3.5-2-1.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                </svg>
+                Settings
+            </button>
         </aside>
 
         <main>
             <header>
-                <div class="header-title" id="activeConversationTitle">Chat</div>
-                <div id="status">Connecting…</div>
+                <div class="header-left">
+                    <button id="sidebarToggle" class="sidebar-toggle" title="Toggle sidebar" aria-label="Toggle sidebar">
+                        <svg class="icon" viewBox="0 0 24 24" fill="none">
+                            <path d="M3 12h18M3 6h18M3 18h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                    <div class="avatar assistant" title="Assistant">A</div>
+                    <div class="header-title" id="activeConversationTitle">Chat</div>
+                </div>
+                <div class="header-actions">
+                    <div id="status">Connecting…</div>
+                </div>
             </header>
 
             <div id="log" aria-label="Chat messages"></div>
@@ -208,10 +620,40 @@
                     Auto voice detection
                 </label>
                 <button id="recordButton">Hold to Speak</button>
+                <div class="input-wrap">
+                    <textarea id="textInput" placeholder="Message…" rows="1"></textarea>
+                    <button id="sendButton">Send</button>
+                </div>
                 <div class="hint">Tip: hold to speak for manual mode, or enable auto voice detection for hands-free.</div>
             </div>
             <audio id="audioPlayer" style="display: none;"></audio>
         </main>
+    </div>
+
+    <div id="settingsModal" class="modal-backdrop" aria-hidden="true">
+        <div class="modal" role="dialog" aria-modal="true" aria-label="Settings">
+            <div class="modal-header">
+                <div class="modal-title">Settings</div>
+                <button id="closeSettingsButton" class="ghost-btn" aria-label="Close settings">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none">
+                        <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                    Close
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="setting-row">
+                    <div class="setting-label">
+                        <b>Theme</b>
+                        <span>Switch between light and dark.</span>
+                    </div>
+                    <label class="switch">
+                        <input type="checkbox" id="themeToggle" />
+                        <span>Light mode</span>
+                    </label>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="/main.js"></script>

@@ -19,10 +19,10 @@ load_dotenv()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"STT using device: {DEVICE}")
 
-# Backend selection: "whisper" (default) or "funasr"
+# Backend selection: "whisper", "funasr", "mlx_funasr", or "kyutai"
 _DEFAULT_BACKEND = os.getenv(
     "STT_BACKEND_DEFAULT",
-    "kyutai",
+    "mlx_funasr",
 )
 STT_BACKEND = os.getenv("STT_BACKEND", _DEFAULT_BACKEND).lower()
 STT_FALLBACK_TO_WHISPER = os.getenv("STT_FALLBACK_TO_WHISPER", "1") == "1"
@@ -60,13 +60,13 @@ except Exception:
     AutoModelForSpeechSeq2Seq = None
 
 # The previous default FunASR model id was invalid/outdated. Keep env override.
-FUNASR_MODEL_ID = os.getenv("FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-fp16")
+FUNASR_MODEL_ID = os.getenv("FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-4bit")
 _funasr_processor: Optional["AutoProcessor"] = None
 _funasr_model: Optional["AutoModelForSpeechSeq2Seq"] = None
 _funasr_use_fp16 = False
 
 # MLX FunASR (Apple Silicon) - via mlx-audio-plus
-MLX_FUNASR_MODEL_ID = os.getenv("MLX_FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-fp16")
+MLX_FUNASR_MODEL_ID = os.getenv("MLX_FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-4bit")
 MLX_FUNASR_FALLBACK_MODEL_ID = os.getenv("MLX_FUNASR_FALLBACK_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-8bit")
 _mlx_funasr_model = None
 
@@ -279,6 +279,56 @@ def _transcribe_with_mlx_funasr(audio_data: np.ndarray) -> str:
         result = model.generate(wav_path)
         text = getattr(result, "text", None)
         return (text or "").strip()
+    finally:
+        if wav_path:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+
+def _transcribe_with_mlx_funasr_streaming(audio_data: np.ndarray):
+    """
+    Stream transcription tokens from FunASR MLX model.
+    Yields tokens as they are generated.
+    
+    Args:
+        audio_data: float32 mono audio @16kHz
+        
+    Yields:
+        str: Individual tokens/chunks as they are generated
+    """
+    model = _get_mlx_funasr_model()
+    wav_path = None
+    try:
+        wav_path = _float32_to_wav_path(audio_data, sample_rate=16000)
+        # Use streaming mode to get token-level updates
+        accumulated_text = ""
+        for chunk in model.generate(wav_path, stream=True):
+            if chunk:
+                # Handle both string chunks and result objects
+                if hasattr(chunk, 'text'):
+                    chunk_text = str(chunk.text).strip()
+                else:
+                    chunk_text = str(chunk).strip()
+                
+                if chunk_text:
+                    # Yield only the new part (incremental update)
+                    if chunk_text.startswith(accumulated_text):
+                        new_text = chunk_text[len(accumulated_text):]
+                        if new_text:
+                            accumulated_text = chunk_text
+                            yield new_text
+                    elif len(chunk_text) > len(accumulated_text):
+                        # Sometimes the model returns full text, extract new part
+                        new_text = chunk_text[len(accumulated_text):]
+                        if new_text:
+                            accumulated_text = chunk_text
+                            yield new_text
+                    else:
+                        # New chunk that doesn't start with accumulated - yield it
+                        accumulated_text = chunk_text
+                        yield chunk_text
     finally:
         if wav_path:
             try:

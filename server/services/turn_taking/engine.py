@@ -40,10 +40,17 @@ class TurnTakingEngine:
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
         self.turn_backend = os.getenv("TURN_TAKING_BACKEND", "smart_turn").lower()
-        self.vad = SileroVAD(sample_rate=sample_rate)  # used for speech gating / barge-in
+        self.disable_silero = os.getenv("DISABLE_SILERO_VAD", "false").lower() == "true"
+
+        if self.disable_silero:
+            print("Silero VAD disabled. Using energy-based gating.")
+            self.vad = None
+        else:
+            self.vad = SileroVAD(sample_rate=sample_rate)  # used for speech gating / barge-in
+
         self.smart_turn: Optional[SmartTurnDetector] = None
-        self.smart_turn_min_silence_ms = float(os.getenv("SMART_TURN_MIN_SILENCE_MS", "220"))
-        self.smart_turn_min_interval_ms = float(os.getenv("SMART_TURN_MIN_INTERVAL_MS", "220"))
+        self.smart_turn_min_silence_ms = float(os.getenv("SMART_TURN_MIN_SILENCE_MS", "100"))
+        self.smart_turn_min_interval_ms = float(os.getenv("SMART_TURN_MIN_INTERVAL_MS", "100"))
         self._last_smart_turn_ts = 0.0
         self._last_smart_turn_prob = 0.0
         if self.turn_backend == "smart_turn":
@@ -53,6 +60,9 @@ class TurnTakingEngine:
                 # Fall back to Silero+prosody if Kyutai deps/model aren't available.
                 print(f"SmartTurn unavailable; falling back to silero. Error: {e}")
                 self.turn_backend = "silero"
+                self.disable_silero = False
+                self.vad = SileroVAD(sample_rate=sample_rate)
+        
         self.prosody = ProsodyTracker(sample_rate=sample_rate, frame_ms=frame_ms, window_s=2.0)
         self.ring = AudioRingBuffer(max_seconds=ring_seconds, sample_rate=sample_rate)
 
@@ -80,8 +90,14 @@ class TurnTakingEngine:
         """
         self.ring.push(frame)
         x = frame.as_float32()
-        vad_res = self.vad.infer(x)
-        p = float(vad_res.p_speech)
+        
+        if self.disable_silero:
+            # Simple energy-based gating (RMS)
+            rms = np.sqrt(np.mean(x**2))
+            p = 1.0 if rms > 0.008 else 0.0 # Adjusted threshold for typical mic levels
+        else:
+            vad_res = self.vad.infer(x)
+            p = float(vad_res.p_speech)
 
         # Prosody tracker always gets frames while speech is active (and for short tail)
         if p >= self.p_speech_off or self._in_speech:
@@ -150,7 +166,10 @@ class TurnTakingEngine:
                 except Exception as e:
                     print(f"SmartTurn runtime error (falling back to heuristics): {e}")
 
-        if self._in_speech and self._silence_ms >= self.finish_silence_ms and self._should_shift(feats):
+        # If Silero is disabled and we're using SmartTurn, bypass heuristic shift.
+        if self.disable_silero and self.turn_backend == "smart_turn":
+            pass
+        elif self._in_speech and self._silence_ms >= self.finish_silence_ms and self._should_shift(feats):
             # finalize segment: from speech_start_seq to last_speech_seq
             start_seq = int(self._speech_start_seq or frame.seq)
             end_seq = int(self._last_speech_seq or frame.seq)

@@ -29,8 +29,15 @@ class SmartTurnDetector:
         self.window_s = int(os.getenv("SMART_TURN_WINDOW_S", "8"))
         self._session = None
         self._feature_extractor = None
+        # Cache a "hard failure" (e.g., missing repo file / no network) so we don't retry and spam logs
+        # on every new websocket / engine instance.
+        if not hasattr(SmartTurnDetector, "_GLOBAL_LOAD_FAILED"):
+            SmartTurnDetector._GLOBAL_LOAD_FAILED = None  # type: ignore[attr-defined]
 
     def _ensure_loaded(self) -> None:
+        failed = getattr(SmartTurnDetector, "_GLOBAL_LOAD_FAILED", None)  # type: ignore[attr-defined]
+        if failed:
+            raise RuntimeError(failed)
         if self._session is not None and self._feature_extractor is not None:
             return
 
@@ -46,6 +53,7 @@ class SmartTurnDetector:
         # Try a few likely filenames to stay robust across model repo updates.
         candidates = [
             os.getenv("SMART_TURN_ONNX_FILENAME", "").strip(),
+            "smart-turn-v3.1-cpu.onnx",
             "smart-turn-v3.1.onnx",
             "smart-turn-v3.onnx",
             "model_int8.onnx",
@@ -62,7 +70,9 @@ class SmartTurnDetector:
                 last_err = e
                 continue
         if onnx_path is None:
-            raise RuntimeError(f"Failed to download SmartTurn ONNX from {self.repo_id}: {last_err}")
+            msg = f"Failed to download SmartTurn ONNX from {self.repo_id}: {last_err}"
+            setattr(SmartTurnDetector, "_GLOBAL_LOAD_FAILED", msg)  # type: ignore[attr-defined]
+            raise RuntimeError(msg)
 
         so = ort.SessionOptions()
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -103,3 +113,11 @@ class SmartTurnDetector:
         return SmartTurnResult(probability_complete=prob, prediction_complete=(prob >= self.threshold))
 
 
+def preload_smart_turn() -> None:
+    """Pre-download and load SmartTurn ONNX model."""
+    try:
+        detector = SmartTurnDetector()
+        detector._ensure_loaded()
+        print("SmartTurn v3 ONNX loaded successfully.")
+    except Exception as e:
+        print(f"SmartTurn preload failed: {e}")

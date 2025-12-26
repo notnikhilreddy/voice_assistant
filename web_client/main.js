@@ -9,6 +9,177 @@ document.addEventListener("DOMContentLoaded", () => {
     const newChatButton = document.getElementById("newChatButton");
     const conversationList = document.getElementById("conversationList");
     const activeConversationTitle = document.getElementById("activeConversationTitle");
+    const textInput = document.getElementById("textInput");
+    const sendButton = document.getElementById("sendButton");
+    const renameChatButton = document.getElementById("renameChatButton");
+    const deleteChatButton = document.getElementById("deleteChatButton");
+    const chatSearch = document.getElementById("chatSearch");
+    const settingsButton = document.getElementById("settingsButton");
+    const settingsModal = document.getElementById("settingsModal");
+    const closeSettingsButton = document.getElementById("closeSettingsButton");
+    const themeToggle = document.getElementById("themeToggle");
+    const sidebarToggle = document.getElementById("sidebarToggle");
+    const sidebarClose = document.getElementById("sidebarClose");
+    const appContainer = document.getElementById("appContainer");
+    const sidebarBackdrop = document.getElementById("sidebarBackdrop");
+
+    // --- Theme (Light/Dark) ---
+    const THEME_KEY = "voice_assistant_theme_v1"; // "dark" | "light"
+    const applyTheme = (t) => {
+        const theme = t === "light" ? "light" : "dark";
+        document.documentElement.dataset.theme = theme;
+        try {
+            if (themeToggle) themeToggle.checked = theme === "light";
+        } catch (e) {}
+        try {
+            localStorage.setItem(THEME_KEY, theme);
+        } catch (e) {}
+    };
+    const initTheme = () => {
+        let t = null;
+        try { t = localStorage.getItem(THEME_KEY); } catch (e) {}
+        // Default to light mode unless user explicitly chose otherwise.
+        if (!t) t = "light";
+        applyTheme(t);
+    };
+    initTheme();
+
+    const openSettings = () => {
+        if (!settingsModal) return;
+        settingsModal.classList.add("open");
+        settingsModal.setAttribute("aria-hidden", "false");
+    };
+    const closeSettings = () => {
+        if (!settingsModal) return;
+        settingsModal.classList.remove("open");
+        settingsModal.setAttribute("aria-hidden", "true");
+    };
+    if (settingsButton) settingsButton.onclick = () => openSettings();
+    if (closeSettingsButton) closeSettingsButton.onclick = () => closeSettings();
+    if (settingsModal) {
+        settingsModal.addEventListener("click", (e) => {
+            if (e.target === settingsModal) closeSettings();
+        });
+    }
+    window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeSettings();
+    });
+    if (themeToggle) {
+        themeToggle.addEventListener("change", () => {
+            applyTheme(themeToggle.checked ? "light" : "dark");
+        });
+    }
+
+    // --- Sidebar Toggle ---
+    const SIDEBAR_KEY = "voice_assistant_sidebar_v1"; // "open" | "closed"
+    const isMobile = () => window.innerWidth <= 768;
+    
+    const getSidebarState = () => {
+        try {
+            const saved = localStorage.getItem(SIDEBAR_KEY);
+            // Default to "open" if not set or if value is invalid
+            if (!saved || (saved !== "closed" && saved !== "open")) {
+                return "open";
+            }
+            return saved;
+        } catch (e) {
+            return "open";
+        }
+    };
+    
+    const setSidebarState = (state) => {
+        try {
+            localStorage.setItem(SIDEBAR_KEY, state);
+        } catch (e) {}
+    };
+    
+    const updateSidebarUI = () => {
+        const mobile = isMobile();
+        const isHidden = appContainer && appContainer.classList.contains("sidebar-hidden");
+        
+        if (sidebarClose) {
+            sidebarClose.style.display = mobile && !isHidden ? "block" : "none";
+        }
+        if (sidebarBackdrop) {
+            sidebarBackdrop.classList.toggle("active", mobile && !isHidden);
+        }
+    };
+    
+    const toggleSidebar = () => {
+        if (!appContainer) return;
+        const isCurrentlyHidden = appContainer.classList.contains("sidebar-hidden");
+        if (isCurrentlyHidden) {
+            appContainer.classList.remove("sidebar-hidden");
+            setSidebarState("open");
+        } else {
+            appContainer.classList.add("sidebar-hidden");
+            setSidebarState("closed");
+        }
+        updateSidebarUI();
+    };
+    
+    const initSidebar = () => {
+        if (!appContainer) return;
+        const state = getSidebarState();
+        const mobile = isMobile();
+        
+        // On desktop, default to open unless explicitly closed
+        // On mobile, start closed
+        if (mobile) {
+            appContainer.classList.add("sidebar-hidden");
+        } else {
+            // Only hide if explicitly saved as closed, otherwise show
+            if (state === "closed") {
+                appContainer.classList.add("sidebar-hidden");
+            } else {
+                // Ensure sidebar is visible on desktop by default
+                appContainer.classList.remove("sidebar-hidden");
+                // If state was not set, save as open
+                if (state !== "open") {
+                    setSidebarState("open");
+                }
+            }
+        }
+        updateSidebarUI();
+    };
+    
+    if (sidebarToggle) {
+        sidebarToggle.addEventListener("click", toggleSidebar);
+    }
+    
+    if (sidebarClose) {
+        sidebarClose.addEventListener("click", toggleSidebar);
+    }
+    
+    if (sidebarBackdrop) {
+        sidebarBackdrop.addEventListener("click", () => {
+            if (isMobile()) {
+                toggleSidebar();
+            }
+        });
+    }
+    
+    // Handle window resize
+    let resizeTimeout;
+    window.addEventListener("resize", () => {
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+            const mobile = isMobile();
+            if (!mobile && appContainer) {
+                // On desktop, restore sidebar if it was open
+                const state = getSidebarState();
+                if (state === "open") {
+                    appContainer.classList.remove("sidebar-hidden");
+                }
+            } else if (mobile && appContainer) {
+                // On mobile, always start closed
+                appContainer.classList.add("sidebar-hidden");
+            }
+            updateSidebarUI();
+        }, 100);
+    });
+    
+    // Sidebar will be initialized after conversations are loaded
 
     // --- Conversation state (ChatGPT-like) ---
     const STORAGE_KEY = "voice_assistant_conversations_v1";
@@ -72,25 +243,155 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const renderSidebar = () => {
-        const convs = Object.values(state.conversations || {});
-        convs.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
-        conversationList.innerHTML = "";
-        for (const c of convs) {
-            const li = document.createElement("li");
-            li.className = `conv-item ${c.id === state.currentId ? "active" : ""}`;
-            li.dataset.id = c.id;
-            const title = document.createElement("div");
-            title.className = "conv-title";
-            title.textContent = c.title || "New chat";
-            const sub = document.createElement("div");
-            sub.className = "conv-sub";
-            const last = (c.messages || []).slice(-1)[0];
-            sub.textContent = last ? `${last.role === "user" ? "You" : "Assistant"}: ${String(last.text || "").trim().slice(0, 40)}` : "No messages yet";
-            li.appendChild(title);
-            li.appendChild(sub);
-            li.onclick = () => selectConversation(c.id);
-            conversationList.appendChild(li);
+        if (!conversationList) {
+            console.error("conversationList element not found");
+            // Try to find it again after a delay (for Edge browser)
+            setTimeout(() => {
+                const retryList = document.getElementById("conversationList");
+                if (retryList) {
+                    console.log("Found conversationList on retry");
+                    renderSidebar();
+                }
+            }, 200);
+            return;
         }
+        try {
+            const q = (chatSearch && chatSearch.value ? String(chatSearch.value) : "").trim().toLowerCase();
+            const convs = Object.values(state.conversations || {});
+            convs.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+            
+            // Clear and ensure visibility
+            conversationList.innerHTML = "";
+            conversationList.style.display = "block";
+            conversationList.style.visibility = "visible";
+            conversationList.style.opacity = "1";
+            
+            // Ensure sidebar container is visible if we have content
+            if (convs.length > 0 && appContainer && !isMobile()) {
+                appContainer.classList.remove("sidebar-hidden");
+            }
+            
+            for (const c of convs) {
+                if (q) {
+                    const hay = `${c.title || ""}\n${(c.messages || []).slice(-3).map((m) => m.text || "").join("\n")}`.toLowerCase();
+                    if (!hay.includes(q)) continue;
+                }
+                const li = document.createElement("li");
+                li.className = `conv-item ${c.id === state.currentId ? "active" : ""}`;
+                li.dataset.id = c.id;
+                const actions = document.createElement("div");
+                actions.className = "conv-actions";
+                const renameBtn = document.createElement("button");
+                renameBtn.className = "icon-btn";
+                renameBtn.title = "Rename";
+                renameBtn.innerHTML = `
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M4 20h4l11-11a2 2 0 0 0 0-3l-1-1a2 2 0 0 0-3 0L4 16v4Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                        <path d="M13 6l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>
+                `;
+                renameBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    renameConversation(c.id);
+                };
+                actions.appendChild(renameBtn);
+
+                const delBtn = document.createElement("button");
+                delBtn.className = "icon-btn";
+                delBtn.title = "Delete";
+                delBtn.innerHTML = `
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <path d="M4 7h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <path d="M10 11v7M14 11v7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        <path d="M6 7l1 14h10l1-14" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                        <path d="M9 7V4h6v3" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+                    </svg>
+                `;
+                delBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    deleteConversation(c.id);
+                };
+                actions.appendChild(delBtn);
+                li.appendChild(actions);
+
+                const title = document.createElement("div");
+                title.className = "conv-title";
+                title.textContent = c.title || "New chat";
+                const sub = document.createElement("div");
+                sub.className = "conv-sub";
+                const last = (c.messages || []).slice(-1)[0];
+                sub.textContent = last ? `${last.role === "user" ? "You" : "Assistant"}: ${String(last.text || "").trim().slice(0, 40)}` : "No messages yet";
+                li.appendChild(title);
+                li.appendChild(sub);
+                li.onclick = () => selectConversation(c.id);
+                conversationList.appendChild(li);
+            }
+            
+            // If no conversations match filter, show message
+            if (conversationList.children.length === 0) {
+                const emptyLi = document.createElement("li");
+                emptyLi.className = "conv-item";
+                emptyLi.style.cssText = "color: var(--muted2); padding: 10px; text-align: center; font-size: 12px;";
+                emptyLi.textContent = q ? "No conversations found" : "No conversations";
+                conversationList.appendChild(emptyLi);
+            }
+        } catch (e) {
+            console.error("Error rendering sidebar:", e);
+            // Ensure sidebar structure remains visible even on error
+            if (conversationList && conversationList.innerHTML === "") {
+                const errorLi = document.createElement("li");
+                errorLi.className = "conv-item";
+                errorLi.style.cssText = "color: var(--muted2); padding: 10px; text-align: center; font-size: 12px;";
+                errorLi.textContent = "Error loading conversations";
+                conversationList.appendChild(errorLi);
+            }
+            // Ensure sidebar is visible even on error
+            if (appContainer && !isMobile()) {
+                appContainer.classList.remove("sidebar-hidden");
+            }
+        }
+    };
+
+    const renameConversation = (id) => {
+        const c = getConv(id);
+        if (!c) return;
+        const next = prompt("Rename chat", c.title || "New chat");
+        if (next === null) return;
+        c.title = String(next).trim() || "New chat";
+        c.updatedAt = nowIso();
+        saveState(state);
+        renderSidebar();
+        if (state.currentId === c.id) {
+            activeConversationTitle.textContent = c.title || "Chat";
+        }
+    };
+
+    const deleteConversation = (id) => {
+        const c = getConv(id);
+        if (!c) return;
+        const ok = confirm(`Delete chat "${c.title || "New chat"}"?`);
+        if (!ok) return;
+        delete state.conversations[id];
+        const remaining = Object.keys(state.conversations || {});
+        if (!remaining.length) {
+            // Always keep at least one chat.
+            const nid = safeId();
+            state.conversations[nid] = {
+                id: nid,
+                title: "New chat",
+                createdAt: nowIso(),
+                updatedAt: nowIso(),
+                messages: [],
+            };
+            state.currentId = nid;
+        } else if (state.currentId === id) {
+            state.currentId = remaining[0];
+        }
+        saveState(state);
+        renderSidebar();
+        renderMessages();
+        bargeIn();
+        wsSendJson({ type: "select_conversation", conversation_id: state.currentId });
     };
 
     const escapeHtml = (s) =>
@@ -99,15 +400,32 @@ document.addEventListener("DOMContentLoaded", () => {
             .replaceAll("<", "&lt;")
             .replaceAll(">", "&gt;");
 
+    const scrollLogToEnd = () => {
+        // Force chat to always stick to the bottom (requested behavior).
+        requestAnimationFrame(() => {
+            try { logDiv.scrollTop = logDiv.scrollHeight; } catch (e) {}
+        });
+    };
+
     const appendMessageDom = (role, text, { partial = false } = {}) => {
         const row = document.createElement("div");
         row.className = `msg-row ${role}`;
+        const avatar = document.createElement("div");
+        avatar.className = `avatar ${role}`;
+        avatar.textContent = role === "user" ? "Y" : "A";
         const bubble = document.createElement("div");
         bubble.className = "msg-bubble";
         bubble.dataset.partial = partial ? "1" : "0";
         bubble.innerHTML = escapeHtml(text);
-        row.appendChild(bubble);
+        if (role === "assistant") {
+            row.appendChild(avatar);
+            row.appendChild(bubble);
+        } else {
+            row.appendChild(bubble);
+            row.appendChild(avatar);
+        }
         logDiv.appendChild(row);
+        scrollLogToEnd();
         return bubble;
     };
 
@@ -115,10 +433,40 @@ document.addEventListener("DOMContentLoaded", () => {
         const c = currentConv();
         activeConversationTitle.textContent = c?.title || "Chat";
         logDiv.innerHTML = "";
-        for (const m of c.messages || []) {
-            appendMessageDom(m.role, m.text || "", { partial: !!m.partial });
+        const msgs = c?.messages || [];
+        if (!msgs.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "empty";
+            wrap.innerHTML = `
+                <div class="empty-card">
+                    <svg width="100%" height="110" viewBox="0 0 640 140" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:block;">
+                        <defs>
+                            <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+                                <stop offset="0" stop-color="#7c3aed" stop-opacity="0.9"/>
+                                <stop offset="1" stop-color="#06b6d4" stop-opacity="0.85"/>
+                            </linearGradient>
+                            <linearGradient id="g2" x1="1" y1="0" x2="0" y2="1">
+                                <stop offset="0" stop-color="#22c55e" stop-opacity="0.9"/>
+                                <stop offset="1" stop-color="#06b6d4" stop-opacity="0.75"/>
+                            </linearGradient>
+                        </defs>
+                        <circle cx="90" cy="70" r="46" fill="url(#g1)" opacity="0.85"/>
+                        <circle cx="170" cy="70" r="28" fill="url(#g2)" opacity="0.85"/>
+                        <rect x="250" y="44" width="340" height="18" rx="9" fill="rgba(255,255,255,0.10)"/>
+                        <rect x="250" y="72" width="280" height="18" rx="9" fill="rgba(255,255,255,0.07)"/>
+                        <rect x="250" y="100" width="220" height="18" rx="9" fill="rgba(255,255,255,0.06)"/>
+                    </svg>
+                    <div class="empty-title">Start a chat</div>
+                    <div class="empty-sub">Type a message, or hold Space / Hold to Speak for voice.</div>
+                </div>
+            `;
+            logDiv.appendChild(wrap);
+        } else {
+            for (const m of msgs) {
+                appendMessageDom(m.role, m.text || "", { partial: !!m.partial });
+            }
         }
-        logDiv.scrollTop = logDiv.scrollHeight;
+        scrollLogToEnd();
     };
 
     const touchConversation = (conv) => {
@@ -129,6 +477,11 @@ document.addEventListener("DOMContentLoaded", () => {
         saveState(state);
         renderSidebar();
         activeConversationTitle.textContent = conv.title || "Chat";
+        if (state.currentId === conv.id) {
+            requestAnimationFrame(() => {
+                logDiv.scrollTop = logDiv.scrollHeight;
+            });
+        }
     };
 
     const upsertUserPartial = (text, convId) => {
@@ -190,11 +543,110 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     ensureAtLeastOneConversation();
+    
+    // Initialize sidebar state (but don't hide if we have content)
+    const initSidebarState = () => {
+        if (!appContainer) return;
+        const state = getSidebarState();
+        const mobile = isMobile();
+        
+        // On desktop, default to open unless explicitly closed
+        // On mobile, start closed
+        if (mobile) {
+            appContainer.classList.add("sidebar-hidden");
+        } else {
+            // Only hide if explicitly saved as closed, otherwise show
+            if (state === "closed") {
+                appContainer.classList.add("sidebar-hidden");
+            } else {
+                // Ensure sidebar is visible on desktop by default
+                appContainer.classList.remove("sidebar-hidden");
+                // If state was not set, save as open
+                if (state !== "open") {
+                    setSidebarState("open");
+                }
+            }
+        }
+        updateSidebarUI();
+    };
+    
+    // Initialize sidebar state first
+    initSidebarState();
+    
+    // Render sidebar content - this will also ensure sidebar stays visible if content exists
     renderSidebar();
+    
+    // Re-render after a short delay for Edge browser compatibility and ensure visibility
+    setTimeout(() => {
+        renderSidebar();
+        // Force sidebar visible on desktop if content exists (override any hidden state)
+        if (appContainer && !isMobile()) {
+            const hasContent = Object.keys(state.conversations || {}).length > 0;
+            if (hasContent) {
+                appContainer.classList.remove("sidebar-hidden");
+                updateSidebarUI();
+            }
+        }
+    }, 300);
+    
     renderMessages();
+
+    if (chatSearch) {
+        chatSearch.addEventListener("input", () => renderSidebar());
+    }
+
+    if (renameChatButton) {
+        renameChatButton.onclick = () => renameConversation(state.currentId);
+    }
+    if (deleteChatButton) {
+        deleteChatButton.onclick = () => deleteConversation(state.currentId);
+    }
 
     let mediaStream = null;
     let websocket = null;
+
+    // STT token streaming (FunASR MLX): throttle UI updates to avoid re-rendering the full chat per token.
+    const sttDraftByConv = new Map(); // convId -> latest accumulated text
+    let sttDraftRaf = 0;
+
+    const updateUserPartialDom = (text) => {
+        // Update/insert the last user partial bubble in-place (no full re-render).
+        const bubbles = logDiv.querySelectorAll('.msg-row.user .msg-bubble[data-partial="1"]');
+        const last = bubbles && bubbles.length ? bubbles[bubbles.length - 1] : null;
+        if (last) {
+            last.innerHTML = escapeHtml(text);
+        } else {
+            appendMessageDom("user", text, { partial: true });
+        }
+        requestAnimationFrame(() => {
+            try { logDiv.scrollTop = logDiv.scrollHeight; } catch (e) {}
+        });
+    };
+
+    const upsertUserPartialTransient = (text, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== "user" || !last.partial) {
+            msgs.push({ role: "user", text, partial: true, ts: nowIso() });
+        } else {
+            last.text = text;
+        }
+        // Don't touchConversation()/saveState()/renderSidebar() on every token.
+        if (state.currentId === convId) updateUserPartialDom(text);
+    };
+
+    const scheduleApplySttDrafts = () => {
+        if (sttDraftRaf) return;
+        sttDraftRaf = requestAnimationFrame(() => {
+            sttDraftRaf = 0;
+            for (const [convId, txt] of sttDraftByConv.entries()) {
+                upsertUserPartialTransient(txt, convId);
+            }
+            sttDraftByConv.clear();
+        });
+    };
 
     // Playback ordering state (server provides turn_id/sentence_idx/chunk_idx)
     let isPlaying = false;
@@ -243,6 +695,57 @@ document.addEventListener("DOMContentLoaded", () => {
         } catch (e) {}
     };
 
+    const sendTextMessage = () => {
+        const raw = textInput ? String(textInput.value || "") : "";
+        const text = raw.trim();
+        if (!text) return;
+        // Ignore accidental/low-signal inputs.
+        if (text === "/sil" || text === "you" || text === "Thank you.") {
+            if (textInput) {
+                textInput.value = "";
+                try { textInput.style.height = ""; } catch (e) {}
+            }
+            return;
+        }
+        const convId = state.currentId;
+        finalizeUserText(text, convId);
+        wsSendJson({ type: "text_input", text, conversation_id: convId });
+        if (textInput) {
+            textInput.value = "";
+            try {
+                textInput.style.height = "";
+            } catch (e) {}
+        }
+    };
+
+    if (sendButton) {
+        sendButton.onclick = () => sendTextMessage();
+    }
+    if (textInput) {
+        // Enter to send; Shift+Enter for newline (ChatGPT-like).
+        textInput.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                sendTextMessage();
+            }
+        });
+        // Auto-grow textarea.
+        textInput.addEventListener("input", () => {
+            try {
+                textInput.style.height = "auto";
+                textInput.style.height = Math.min(textInput.scrollHeight, 140) + "px";
+            } catch (e) {}
+        });
+    }
+
+    // Convert local messages to LLM history format for server sync
+    const messagesToLLMHistory = (messages) => {
+        if (!messages || !messages.length) return [];
+        return messages
+            .filter(m => !m.partial && m.text && m.text.trim())
+            .map(m => ({ role: m.role, content: m.text.trim() }));
+    };
+
     const selectConversation = (id) => {
         if (!id || !state.conversations[id]) return;
         state.currentId = id;
@@ -250,7 +753,13 @@ document.addEventListener("DOMContentLoaded", () => {
         renderSidebar();
         renderMessages();
         bargeIn();
-        wsSendJson({ type: "select_conversation", conversation_id: id });
+        const conv = state.conversations[id];
+        // Send history so server can continue the conversation after page refresh
+        wsSendJson({
+            type: "select_conversation",
+            conversation_id: id,
+            history: messagesToLLMHistory(conv.messages || []),
+        });
     };
 
     const newConversation = () => {
@@ -459,7 +968,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
         websocket.onopen = () => {
             websocket.send(JSON.stringify({ type: "pcm_stream_start", sample_rate: 16000, frame_ms: 20 }));
-            wsSendJson({ type: "select_conversation", conversation_id: state.currentId });
+            // Send current conversation with history so server can continue after page refresh
+            const conv = state.conversations[state.currentId];
+            wsSendJson({
+                type: "select_conversation",
+                conversation_id: state.currentId,
+                history: messagesToLLMHistory(conv ? conv.messages : []),
+            });
             statusDiv.textContent = "Connected";
         };
 
@@ -518,8 +1033,18 @@ document.addEventListener("DOMContentLoaded", () => {
             } else if (message.type === "stream_done") {
                 finalizeAssistantText(message.data, convId);
                 statusDiv.textContent = "Ready to speak";
+            } else if (message.type === "stt_token") {
+                // Token-level (or small-delta) updates from FunASR MLX.
+                // Prefer `accumulated` if present (server may batch deltas).
+                const acc = typeof message.accumulated === "string" ? message.accumulated : "";
+                const delta = typeof message.data === "string" ? message.data : "";
+                const nextText = (acc || delta || "").trim();
+                if (!nextText || nextText === "/sil") return;
+                sttDraftByConv.set(convId, nextText);
+                scheduleApplySttDrafts();
             } else if (message.type === "stt_partial") {
                 if (typeof message.data === "string" && message.data.trim()) {
+                    if (message.data.trim() === "/sil") return;
                     upsertUserPartial(message.data, convId);
                 }
             } else if (message.type === "error") {
