@@ -6,8 +6,193 @@ document.addEventListener("DOMContentLoaded", () => {
     const logDiv = document.getElementById("log");
     const audioPlayer = document.getElementById("audioPlayer");
     const autoVADToggle = document.getElementById("autoVADToggle");
+    const newChatButton = document.getElementById("newChatButton");
+    const conversationList = document.getElementById("conversationList");
+    const activeConversationTitle = document.getElementById("activeConversationTitle");
 
-    let assistantAppended = false;
+    // --- Conversation state (ChatGPT-like) ---
+    const STORAGE_KEY = "voice_assistant_conversations_v1";
+
+    const nowIso = () => new Date().toISOString();
+    const safeId = () => (crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}_${Math.random()}`);
+
+    const loadState = () => {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || parsed.version !== 1) return null;
+            return parsed;
+        } catch (e) {
+            return null;
+        }
+    };
+
+    const saveState = (st) => {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(st));
+        } catch (e) {}
+    };
+
+    let state =
+        loadState() ||
+        ({
+            version: 1,
+            currentId: "",
+            conversations: {},
+        });
+
+    const ensureAtLeastOneConversation = () => {
+        const ids = Object.keys(state.conversations || {});
+        if (!ids.length) {
+            const id = safeId();
+            state.conversations[id] = {
+                id,
+                title: "New chat",
+                createdAt: nowIso(),
+                updatedAt: nowIso(),
+                messages: [],
+            };
+            state.currentId = id;
+            saveState(state);
+        } else if (!state.currentId || !state.conversations[state.currentId]) {
+            state.currentId = ids[0];
+            saveState(state);
+        }
+    };
+
+    const getConv = (id) => state.conversations[id];
+    const currentConv = () => getConv(state.currentId);
+
+    const formatTitleFromFirstUserMessage = (conv) => {
+        const firstUser = (conv.messages || []).find((m) => m.role === "user" && m.text && !m.partial);
+        if (!firstUser) return "New chat";
+        const t = String(firstUser.text).trim().replace(/\s+/g, " ");
+        return t.length > 34 ? `${t.slice(0, 34)}…` : t;
+    };
+
+    const renderSidebar = () => {
+        const convs = Object.values(state.conversations || {});
+        convs.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+        conversationList.innerHTML = "";
+        for (const c of convs) {
+            const li = document.createElement("li");
+            li.className = `conv-item ${c.id === state.currentId ? "active" : ""}`;
+            li.dataset.id = c.id;
+            const title = document.createElement("div");
+            title.className = "conv-title";
+            title.textContent = c.title || "New chat";
+            const sub = document.createElement("div");
+            sub.className = "conv-sub";
+            const last = (c.messages || []).slice(-1)[0];
+            sub.textContent = last ? `${last.role === "user" ? "You" : "Assistant"}: ${String(last.text || "").trim().slice(0, 40)}` : "No messages yet";
+            li.appendChild(title);
+            li.appendChild(sub);
+            li.onclick = () => selectConversation(c.id);
+            conversationList.appendChild(li);
+        }
+    };
+
+    const escapeHtml = (s) =>
+        String(s)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+
+    const appendMessageDom = (role, text, { partial = false } = {}) => {
+        const row = document.createElement("div");
+        row.className = `msg-row ${role}`;
+        const bubble = document.createElement("div");
+        bubble.className = "msg-bubble";
+        bubble.dataset.partial = partial ? "1" : "0";
+        bubble.innerHTML = escapeHtml(text);
+        row.appendChild(bubble);
+        logDiv.appendChild(row);
+        return bubble;
+    };
+
+    const renderMessages = () => {
+        const c = currentConv();
+        activeConversationTitle.textContent = c?.title || "Chat";
+        logDiv.innerHTML = "";
+        for (const m of c.messages || []) {
+            appendMessageDom(m.role, m.text || "", { partial: !!m.partial });
+        }
+        logDiv.scrollTop = logDiv.scrollHeight;
+    };
+
+    const touchConversation = (conv) => {
+        conv.updatedAt = nowIso();
+        if (!conv.title || conv.title === "New chat") {
+            conv.title = formatTitleFromFirstUserMessage(conv);
+        }
+        saveState(state);
+        renderSidebar();
+        activeConversationTitle.textContent = conv.title || "Chat";
+    };
+
+    const upsertUserPartial = (text, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== "user" || !last.partial) {
+            msgs.push({ role: "user", text, partial: true, ts: nowIso() });
+        } else {
+            last.text = text;
+        }
+        touchConversation(conv);
+        if (state.currentId === convId) renderMessages();
+    };
+
+    const finalizeUserText = (text, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === "user" && last.partial) {
+            last.partial = false;
+            last.text = text;
+        } else {
+            msgs.push({ role: "user", text, partial: false, ts: nowIso() });
+        }
+        touchConversation(conv);
+        if (state.currentId === convId) renderMessages();
+    };
+
+    const upsertAssistantPartial = (text, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== "assistant" || !last.partial) {
+            msgs.push({ role: "assistant", text, partial: true, ts: nowIso() });
+        } else {
+            last.text = text;
+        }
+        touchConversation(conv);
+        if (state.currentId === convId) renderMessages();
+    };
+
+    const finalizeAssistantText = (text, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === "assistant" && last.partial) {
+            last.partial = false;
+            last.text = text;
+        } else if (text && String(text).trim()) {
+            msgs.push({ role: "assistant", text, partial: false, ts: nowIso() });
+        }
+        touchConversation(conv);
+        if (state.currentId === convId) renderMessages();
+    };
+
+    ensureAtLeastOneConversation();
+    renderSidebar();
+    renderMessages();
+
     let mediaStream = null;
     let websocket = null;
 
@@ -18,14 +203,6 @@ document.addEventListener("DOMContentLoaded", () => {
     let expectedChunkIdx = 0;
     const bufferedAudio = new Map(); // key: "sentence:chunk" -> objectURL
     const sentenceChunkCounts = new Map(); // sentence_idx -> chunk_count
-
-    // WebAudio playback (gapless)
-    let playCtx = null;
-    let playHead = 0;
-    let scheduledUntil = 0;
-    let audioDoneTimer = null;
-    let activeTurnForPlayback = null;
-    let sentClientStartForTurn = new Set();
 
     // PCM streaming state (20ms frames @ 16kHz)
     let audioCtx = null;
@@ -56,20 +233,44 @@ document.addEventListener("DOMContentLoaded", () => {
         playbackTurnId = null;
         expectedSentenceIdx = 0;
         expectedChunkIdx = 0;
-
-        // Stop WebAudio scheduled playback
-        if (audioDoneTimer) {
-            clearTimeout(audioDoneTimer);
-            audioDoneTimer = null;
-        }
-        if (playCtx) {
-            try { playCtx.close(); } catch (e) {}
-        }
-        playCtx = null;
-        playHead = 0;
-        scheduledUntil = 0;
-        activeTurnForPlayback = null;
     };
+
+    const wsSendJson = (obj) => {
+        try {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(JSON.stringify(obj));
+            }
+        } catch (e) {}
+    };
+
+    const selectConversation = (id) => {
+        if (!id || !state.conversations[id]) return;
+        state.currentId = id;
+        saveState(state);
+        renderSidebar();
+        renderMessages();
+        bargeIn();
+        wsSendJson({ type: "select_conversation", conversation_id: id });
+    };
+
+    const newConversation = () => {
+        const id = safeId();
+        state.conversations[id] = {
+            id,
+            title: "New chat",
+            createdAt: nowIso(),
+            updatedAt: nowIso(),
+            messages: [],
+        };
+        state.currentId = id;
+        saveState(state);
+        renderSidebar();
+        renderMessages();
+        bargeIn();
+        wsSendJson({ type: "new_conversation", conversation_id: id });
+    };
+
+    newChatButton.onclick = () => newConversation();
 
     const ensureStream = async () => {
         if (mediaStream) return mediaStream;
@@ -92,7 +293,6 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     const playNextAudio = () => {
-        // Deprecated: old HTMLAudio pipeline. Kept for backward-compat if server sends JSON base64 audio.
         if (isPlaying) return;
         tryAdvanceSentence();
         const key = _key(expectedSentenceIdx, expectedChunkIdx);
@@ -101,12 +301,24 @@ document.addEventListener("DOMContentLoaded", () => {
         bufferedAudio.delete(key);
         isPlaying = true;
         audioPlayer.src = url;
-        audioPlayer.play().catch((err) => console.error("Playback error:", err));
+        audioPlayer
+            .play()
+            .then(() => {
+                // Notify server when client actually starts playback for this turn.
+                try {
+                    if (websocket && websocket.readyState === WebSocket.OPEN && playbackTurnId !== null) {
+                        websocket.send(JSON.stringify({ type: "client_audio_started", turn_id: playbackTurnId }));
+                    }
+                } catch (e) {}
+            })
+            .catch((err) => console.error("Playback error:", err));
     };
 
     audioPlayer.onended = () => {
         isPlaying = false;
-        try { URL.revokeObjectURL(audioPlayer.src); } catch (e) {}
+        try {
+            URL.revokeObjectURL(audioPlayer.src);
+        } catch (e) {}
         expectedChunkIdx += 1;
         playNextAudio();
     };
@@ -137,108 +349,6 @@ document.addEventListener("DOMContentLoaded", () => {
             bufferedAudio.set(_key(expectedSentenceIdx, expectedChunkIdx), url);
         }
         playNextAudio();
-    };
-
-    const ensurePlayCtx = async () => {
-        if (playCtx) return playCtx;
-        playCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
-        playHead = playCtx.currentTime + 0.05;
-        scheduledUntil = playHead;
-        return playCtx;
-    };
-
-    const scheduleDecodedBuffer = async (turnId, sentenceIdx, chunkIdx, chunkCount, audioBuffer) => {
-        await ensurePlayCtx();
-
-        if (activeTurnForPlayback === null) {
-            activeTurnForPlayback = turnId;
-        } else if (turnId !== activeTurnForPlayback) {
-            bargeIn();
-            await ensurePlayCtx();
-            activeTurnForPlayback = turnId;
-        }
-
-        // Store decoded buffer in ordering map (reuse bufferedAudio map but store AudioBuffer)
-        bufferedAudio.set(_key(sentenceIdx, chunkIdx), audioBuffer);
-        sentenceChunkCounts.set(sentenceIdx, chunkCount);
-
-        const pump = () => {
-            tryAdvanceSentence();
-            const k = _key(expectedSentenceIdx, expectedChunkIdx);
-            const buf = bufferedAudio.get(k);
-            if (!buf) return;
-            bufferedAudio.delete(k);
-
-            const src = playCtx.createBufferSource();
-            src.buffer = buf;
-            src.connect(playCtx.destination);
-
-            const startAt = Math.max(playCtx.currentTime + 0.02, playHead);
-            src.start(startAt);
-            playHead = startAt + buf.duration;
-
-            // first audio started for this turn
-            if (!sentClientStartForTurn.has(turnId)) {
-                sentClientStartForTurn.add(turnId);
-                try {
-                    websocket.send(JSON.stringify({ type: "client_audio_started", turn_id: turnId, client_epoch_ms: Date.now() }));
-                } catch (e) {}
-            }
-
-            expectedChunkIdx += 1;
-
-            // schedule done timer (updated on every scheduled chunk)
-            if (audioDoneTimer) clearTimeout(audioDoneTimer);
-            const msUntilDone = Math.max(10, (playHead - playCtx.currentTime) * 1000 + 30);
-            audioDoneTimer = setTimeout(() => {
-                try {
-                    websocket.send(JSON.stringify({ type: "client_audio_done", turn_id: turnId, client_epoch_ms: Date.now() }));
-                } catch (e) {}
-            }, msUntilDone);
-
-            // keep pumping if next is ready
-            pump();
-        };
-
-        pump();
-    };
-
-    const appendAssistant = (text) => {
-        const p = document.createElement("p");
-        p.className = "llm-text";
-        p.innerHTML = `<strong>Assistant:</strong> ${text}`;
-        logDiv.appendChild(p);
-        assistantAppended = true;
-    };
-
-    const appendUser = (text) => {
-        const p = document.createElement("p");
-        p.className = "user-text";
-        p.innerHTML = `<strong>You:</strong> ${text}`;
-        logDiv.appendChild(p);
-    };
-
-    const upsertUserPartial = (text) => {
-        const last = logDiv.querySelector("p.user-text:last-of-type");
-        if (!last || !last.dataset || last.dataset.partial !== "1") {
-            const p = document.createElement("p");
-            p.className = "user-text";
-            p.dataset.partial = "1";
-            p.innerHTML = `<strong>You:</strong> ${text}`;
-            logDiv.appendChild(p);
-            return;
-        }
-        last.innerHTML = `<strong>You:</strong> ${text}`;
-    };
-
-    const finalizeUserPartial = (text) => {
-        const last = logDiv.querySelector("p.user-text:last-of-type");
-        if (last && last.dataset && last.dataset.partial === "1") {
-            last.dataset.partial = "0";
-            last.innerHTML = `<strong>You:</strong> ${text}`;
-            return;
-        }
-        appendUser(text);
     };
 
     const floatToInt16 = (f) => {
@@ -346,35 +456,14 @@ document.addEventListener("DOMContentLoaded", () => {
     const connectWebSocket = () => {
         const wsUrl = `ws://${window.location.host}/ws`;
         websocket = new WebSocket(wsUrl);
-        websocket.binaryType = "arraybuffer";
 
         websocket.onopen = () => {
             websocket.send(JSON.stringify({ type: "pcm_stream_start", sample_rate: 16000, frame_ms: 20 }));
+            wsSendJson({ type: "select_conversation", conversation_id: state.currentId });
             statusDiv.textContent = "Connected";
         };
 
         websocket.onmessage = (event) => {
-            // Binary audio frame path: [16-byte header][WAV bytes]
-            if (event.data instanceof ArrayBuffer) {
-                const buf = event.data;
-                if (buf.byteLength > 16) {
-                    const dv = new DataView(buf);
-                    const turnId = dv.getUint32(0, true);
-                    const sentenceIdx = dv.getUint32(4, true);
-                    const chunkIdx = dv.getUint32(8, true);
-                    const chunkCount = dv.getUint32(12, true);
-                    const wavBytes = buf.slice(16);
-                    ensurePlayCtx().then(() => {
-                        playCtx.decodeAudioData(wavBytes.slice(0)).then((audioBuffer) => {
-                            scheduleDecodedBuffer(turnId, sentenceIdx, chunkIdx, chunkCount, audioBuffer);
-                        }).catch((e) => {
-                            console.error("decodeAudioData failed", e);
-                        });
-                    });
-                }
-                return;
-            }
-
             let message;
             try {
                 message = JSON.parse(event.data);
@@ -401,21 +490,15 @@ document.addEventListener("DOMContentLoaded", () => {
                 return;
             }
 
-            if (message.type === "turn_end") {
-                // Optional: could display or store for client-side latency debugging
+            const convId = message.conversation_id || state.currentId;
+            if (message.type === "conversation_ack") {
+                // Server accepted conversation switch; nothing else required.
                 return;
             }
-
             if (message.type === "user_text") {
-                finalizeUserPartial(message.data);
-                assistantAppended = false;
+                finalizeUserText(message.data, convId);
             } else if (message.type === "llm_partial") {
-                if (!assistantAppended) {
-                    appendAssistant(message.data);
-                } else {
-                    const last = logDiv.querySelector("p.llm-text:last-of-type");
-                    if (last) last.innerHTML = `<strong>Assistant:</strong> ${message.data}`;
-                }
+                upsertAssistantPartial(message.data, convId);
             } else if (message.type === "audio_chunk") {
                 if (message.data) {
                     statusDiv.textContent = "Playing response...";
@@ -433,17 +516,15 @@ document.addEventListener("DOMContentLoaded", () => {
                     playNextAudio();
                 }
             } else if (message.type === "stream_done") {
-                if (!assistantAppended) appendAssistant(message.data);
+                finalizeAssistantText(message.data, convId);
                 statusDiv.textContent = "Ready to speak";
             } else if (message.type === "stt_partial") {
                 if (typeof message.data === "string" && message.data.trim()) {
-                    upsertUserPartial(message.data);
+                    upsertUserPartial(message.data, convId);
                 }
             } else if (message.type === "error") {
                 statusDiv.textContent = message.message;
             }
-
-            logDiv.scrollTop = logDiv.scrollHeight;
         };
 
         websocket.onclose = () => {
@@ -457,30 +538,56 @@ document.addEventListener("DOMContentLoaded", () => {
         };
     };
 
+    // --- Unified manual hold-to-speak helpers (mouse/touch/keyboard) ---
+    let manualHeld = false;
+    const startManualHold = async () => {
+        if (manualHeld) return;
+        manualHeld = true;
+        bargeIn();
+        try {
+            websocket.send(JSON.stringify({ type: "mode", value: "manual" }));
+            websocket.send(JSON.stringify({ type: "manual_start" }));
+        } catch (e) {}
+        await startStreaming("manual");
+    };
+
+    const endManualHold = () => {
+        if (!manualHeld) return;
+        manualHeld = false;
+        try {
+            websocket.send(JSON.stringify({ type: "manual_end" }));
+        } catch (e) {}
+        stopStreamingSoon(0);
+    };
+
     // Manual hold-to-speak
-    recordButton.addEventListener("mousedown", async () => {
-        bargeIn();
-        try {
-            websocket.send(JSON.stringify({ type: "mode", value: "manual" }));
-            websocket.send(JSON.stringify({ type: "manual_start" }));
-        } catch (e) {}
-        await startStreaming("manual");
+    recordButton.addEventListener("mousedown", startManualHold);
+    recordButton.addEventListener("mouseup", endManualHold);
+    recordButton.addEventListener("mouseleave", endManualHold);
+    recordButton.addEventListener("touchstart", (e) => {
+        try { e.preventDefault(); } catch (err) {}
+        startManualHold();
+    }, { passive: false });
+    recordButton.addEventListener("touchend", endManualHold);
+
+    // Hold spacebar to speak (manual mode).
+    window.addEventListener("keydown", (e) => {
+        // Ignore when typing in inputs.
+        const tag = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : "";
+        if (tag === "input" || tag === "textarea" || (e.target && e.target.isContentEditable)) return;
+        if (e.code !== "Space") return;
+        // Prevent page scroll.
+        e.preventDefault();
+        // Key repeat guard.
+        if (e.repeat) return;
+        startManualHold();
     });
-    recordButton.addEventListener("mouseup", () => {
-        try { websocket.send(JSON.stringify({ type: "manual_end" })); } catch (e) {}
-        stopStreamingSoon(0);
-    });
-    recordButton.addEventListener("touchstart", async () => {
-        bargeIn();
-        try {
-            websocket.send(JSON.stringify({ type: "mode", value: "manual" }));
-            websocket.send(JSON.stringify({ type: "manual_start" }));
-        } catch (e) {}
-        await startStreaming("manual");
-    });
-    recordButton.addEventListener("touchend", () => {
-        try { websocket.send(JSON.stringify({ type: "manual_end" })); } catch (e) {}
-        stopStreamingSoon(0);
+    window.addEventListener("keyup", (e) => {
+        const tag = (e.target && e.target.tagName) ? String(e.target.tagName).toLowerCase() : "";
+        if (tag === "input" || tag === "textarea" || (e.target && e.target.isContentEditable)) return;
+        if (e.code !== "Space") return;
+        e.preventDefault();
+        endManualHold();
     });
 
     // Auto voice detection (server-side turn-taking)

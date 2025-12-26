@@ -11,14 +11,13 @@ from dotenv import load_dotenv
 import torch
 import numpy as np 
 from pydub import AudioSegment
-import logging
 
 # Load .env early so backend/model env vars are picked up.
 load_dotenv()
 
 # Determine device (CUDA if available, else CPU)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logging.getLogger("voice_assistant").info(f"STT using device: {DEVICE}")
+print(f"STT using device: {DEVICE}")
 
 # Backend selection: "whisper" (default) or "funasr"
 _DEFAULT_BACKEND = os.getenv(
@@ -373,8 +372,11 @@ def _transcribe_with_whisper(audio_data: np.ndarray) -> str:
     transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     result = transcription.strip()
     
-    if os.getenv("DEBUG_STT", "0") == "1":
-        logging.getLogger("voice_assistant").debug(f"Whisper transcription: '{result}'")
+    # Debug output
+    if result:
+        print(f"Whisper transcription: '{result}'")
+    else:
+        print("WARNING: Whisper returned empty transcription")
     
     return result
 
@@ -484,11 +486,10 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         # Ensure audio is in valid range and not all zeros
         audio_data = np.clip(audio_samples, -1.0, 1.0)
         
-        if os.getenv("DEBUG_STT", "0") == "1":
-            logging.getLogger("voice_assistant").debug(
-                f"Audio stats: shape={audio_data.shape}, duration={len(audio_data)/16000:.2f}s, "
-                f"max={np.max(np.abs(audio_data)):.4f}, mean={np.mean(np.abs(audio_data)):.4f}"
-            )
+        # Debug: Check audio characteristics
+        if np.max(np.abs(audio_data)) < 0.01:
+            print(f"WARNING: Audio appears to be very quiet (max amplitude: {np.max(np.abs(audio_data)):.6f})")
+        print(f"Audio stats: shape={audio_data.shape}, duration={len(audio_data)/16000:.2f}s, max={np.max(np.abs(audio_data)):.4f}, mean={np.mean(np.abs(audio_data)):.4f}")
 
         # Transcribe with selected backend (auto-fallback to Whisper to avoid repeated load errors)
         asr_start = perf_counter()
@@ -532,13 +533,13 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                     text = ""
         asr_ms = (perf_counter() - asr_start) * 1000
         total_ms = (perf_counter() - wall_start) * 1000
-        logging.getLogger("voice_assistant").info(
-            f"STT [{backend_name or backend_used}] ms decode={decode_ms:.0f} asr={asr_ms:.0f} total={total_ms:.0f}"
+        print(
+            f"STT [{backend_name or backend_used}] (ms): decode+resample={decode_ms:.1f}, asr={asr_ms:.1f}, total={total_ms:.1f}"
         )
         
         return text
     except Exception as e:
-        logging.getLogger("voice_assistant").exception(f"Error during transcription: {e}")
+        print(f"Error during transcription: {e}")
         return ""
 
 if __name__ == '__main__':

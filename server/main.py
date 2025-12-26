@@ -7,10 +7,6 @@ import base64
 import io
 import json
 import struct
-import time
-import logging
-import warnings
-import os
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -21,22 +17,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from .services import stt, tts, llm
+from .services.metrics_dashboard import get_store, start_dashboard
 from .services.sentence_splitter import detect_complete_sentences
 from .services.turn_taking import TurnTakingEngine, TurnState
 from .services.turn_taking.ring_buffer import AudioFrame
-
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-warnings.filterwarnings("ignore", message=".*Redirects are currently not supported.*")
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")
-log = logging.getLogger("voice_assistant")
-logging.getLogger("uvicorn").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("watchfiles").setLevel(logging.WARNING)
 
 app = FastAPI()
 
@@ -46,10 +30,36 @@ WEB_CLIENT_DIR = BASE_DIR / "web_client"
 # Thread pool executor for CPU-bound TTS operations
 tts_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tts")
 
+async def _stream_tts_chunks(
+    text: str,
+    out_q: "asyncio.Queue[bytes]",
+    done_evt: asyncio.Event,
+    cancel_evt: asyncio.Event | None = None,
+) -> None:
+    """
+    Run TTS in executor but stream chunks back to asyncio as they are produced.
+    This restores low-latency first-audio while still allowing ordered playback.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        try:
+            for chunk in tts.stream_speech(text):
+                if cancel_evt is not None and cancel_evt.is_set():
+                    break
+                if not chunk:
+                    continue
+                loop.call_soon_threadsafe(out_q.put_nowait, chunk)
+        finally:
+            loop.call_soon_threadsafe(done_evt.set)
+
+    await loop.run_in_executor(tts_executor, _run)
+
 
 @app.on_event("startup")
 async def preload_models():
     """Load server-side models on startup to avoid first-request latency."""
+    start_dashboard()
     try:
         stt.preload_stt()
     except Exception as e:
@@ -97,18 +107,6 @@ def _parse_pcm_frame(payload: bytes) -> tuple[int, bytes]:
     seq = struct.unpack_from("<I", payload, 0)[0]
     pcm16 = payload[4:]
     return int(seq), pcm16
-
-
-def _pack_audio_header(turn_id: int, sentence_idx: int, chunk_idx: int, chunk_count: int) -> bytes:
-    # 16-byte little-endian header: turn_id, sentence_idx, chunk_idx, chunk_count
-    return struct.pack("<IIII", int(turn_id), int(sentence_idx), int(chunk_idx), int(chunk_count))
-
-
-def _unpack_audio_header(payload: bytes) -> tuple[int, int, int, int, bytes]:
-    if len(payload) < 16:
-        raise ValueError("audio payload too short")
-    turn_id, sentence_idx, chunk_idx, chunk_count = struct.unpack_from("<IIII", payload, 0)
-    return int(turn_id), int(sentence_idx), int(chunk_idx), int(chunk_count), payload[16:]
 
 
 async def _legacy_ws_loop(
@@ -173,73 +171,90 @@ async def _legacy_ws_loop(
             audio_chunk_count = 0
             sentence_count = 0
             
-            # Strict ordering for audio delivery
-            audio_by_sentence: dict[int, list[bytes]] = {}
-            sentence_chunk_counts: dict[int, int] = {}
-            send_condition = asyncio.Condition()
+            # Strict ordering for audio delivery, while still streaming chunks ASAP.
             llm_done = False
-            tts_done_sentences: set[int] = set()
-
+            sentence_queues: dict[int, asyncio.Queue[bytes]] = {}
+            sentence_done: dict[int, asyncio.Event] = {}
+            sentence_ready = asyncio.Event()
             tts_tasks: list[asyncio.Task] = []
             
             async def process_sentence_for_tts(sentence: str, sentence_idx: int):
                 nonlocal audio_chunk_count, first_audio_ms, first_sentence_ms
                 try:
-                    def synthesize_sentence(s: str):
-                        return list(tts.stream_speech(s))
-                    
-                    audio_chunks = await asyncio.get_event_loop().run_in_executor(
-                        tts_executor, synthesize_sentence, sentence
-                    )
-                    filtered = [c for c in audio_chunks if c]
-                    async with send_condition:
-                        audio_by_sentence[sentence_idx] = filtered
-                        sentence_chunk_counts[sentence_idx] = len(filtered)
-                        tts_done_sentences.add(sentence_idx)
-                        send_condition.notify_all()
+                    q = sentence_queues.get(sentence_idx)
+                    if q is None:
+                        q = asyncio.Queue()
+                        sentence_queues[sentence_idx] = q
+                    done_evt = sentence_done.get(sentence_idx)
+                    if done_evt is None:
+                        done_evt = asyncio.Event()
+                        sentence_done[sentence_idx] = done_evt
+                    sentence_ready.set()
+                    await _stream_tts_chunks(sentence, q, done_evt, cancel_evt=None)
                 except Exception as e:
                     print(f"Error in TTS for sentence {sentence_idx}: {e}")
+                    # Mark sentence done so sender can progress.
+                    if sentence_idx not in sentence_done:
+                        sentence_done[sentence_idx] = asyncio.Event()
+                    sentence_done[sentence_idx].set()
 
             async def ordered_audio_sender():
                 nonlocal audio_chunk_count, first_audio_ms, first_sentence_ms
                 next_sentence = 0
                 while True:
-                    async with send_condition:
-                        await send_condition.wait_for(
-                            lambda: (next_sentence in tts_done_sentences)
-                            or (llm_done and next_sentence >= sentence_count)
-                        )
+                    if llm_done and next_sentence >= sentence_count and next_sentence not in sentence_queues:
+                        return
+                    if next_sentence not in sentence_queues:
                         if llm_done and next_sentence >= sentence_count:
                             return
-                        chunks = audio_by_sentence.get(next_sentence, [])
-                        chunk_count = sentence_chunk_counts.get(next_sentence, len(chunks))
+                        await sentence_ready.wait()
+                        sentence_ready.clear()
+                        continue
 
-                    for chunk_idx, audio_chunk in enumerate(chunks):
-                        audio_chunk_count += 1
-                        if first_audio_ms is None:
-                            first_audio_ms = (perf_counter() - overall_start) * 1000
-                            first_sentence_ms = (perf_counter() - llm_start) * 1000
-                        audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
-                        await websocket.send_json(
-                            {
-                            "type": "audio_chunk",
-                            "data": audio_base64,
-                                "turn_id": turn_id,
-                                "sentence_idx": next_sentence,
-                                "chunk_idx": chunk_idx,
-                                "chunk_count": chunk_count,
-                            "final": False,
-                            "index": audio_chunk_count - 1,
-                            }
+                    q = sentence_queues[next_sentence]
+                    done_evt = sentence_done.get(next_sentence) or asyncio.Event()
+                    sentence_done[next_sentence] = done_evt
+                    sent = 0
+                    while True:
+                        if q.empty() and done_evt.is_set():
+                            break
+                        get_task = asyncio.create_task(q.get())
+                        done_task = asyncio.create_task(done_evt.wait())
+                        done_set, _ = await asyncio.wait(
+                            {get_task, done_task}, return_when=asyncio.FIRST_COMPLETED
                         )
-                        await asyncio.sleep(0)
+                        if get_task in done_set:
+                            done_task.cancel()
+                            audio_chunk = get_task.result()
+                            audio_chunk_count += 1
+                            if first_audio_ms is None:
+                                first_audio_ms = (perf_counter() - overall_start) * 1000
+                                first_sentence_ms = (perf_counter() - llm_start) * 1000
+                            audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
+                            await websocket.send_json(
+                                {
+                                    "type": "audio_chunk",
+                                    "data": audio_base64,
+                                    "turn_id": turn_id,
+                                    "sentence_idx": next_sentence,
+                                    "chunk_idx": sent,
+                                    "chunk_count": None,
+                                    "final": False,
+                                    "index": audio_chunk_count - 1,
+                                }
+                            )
+                            sent += 1
+                            await asyncio.sleep(0)
+                        else:
+                            get_task.cancel()
+                            break
 
                     await websocket.send_json(
                         {
                             "type": "sentence_done",
                             "turn_id": turn_id,
                             "sentence_idx": next_sentence,
-                            "chunk_count": chunk_count,
+                            "chunk_count": sent,
                         }
                     )
                     next_sentence += 1
@@ -337,8 +352,31 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
     New mode: client streams 20ms PCM16 frames; server does turn-taking (VAD+prosody)
     and triggers STT+LLM+TTS as soon as USER_FINISHED is detected.
     """
-    conversation_history: list = []
-    history_summary = ""
+    # Multi-conversation support (ChatGPT-style UI): keep independent LLM histories
+    # keyed by conversation_id within this websocket session.
+    from uuid import uuid4
+
+    conversation_id = "default"
+    conversations: dict[str, dict[str, object]] = {conversation_id: {"history": [], "summary": ""}}
+
+    def _ensure_conv(cid: str) -> dict[str, object]:
+        cid = cid or "default"
+        st = conversations.get(cid)
+        if st is None:
+            st = {"history": [], "summary": ""}
+            conversations[cid] = st
+        return st
+
+    async def _send_json(payload: dict, *, cid: str | None = None) -> None:
+        use_cid = cid or conversation_id
+        if "conversation_id" not in payload:
+            payload["conversation_id"] = use_cid
+        await websocket.send_json(payload)
+
+    # Active conversation state (updated by select/new conversation control messages)
+    _st0 = _ensure_conv(conversation_id)
+    conversation_history: list = list(_st0.get("history") or [])
+    history_summary: str = str(_st0.get("summary") or "")
     turn_id = 0
 
     engine = TurnTakingEngine(sample_rate=16000, frame_ms=20, ring_seconds=2.5)
@@ -351,6 +389,7 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
     manual_active = False
     manual_turn_id = 0
     manual_partial_text = ""
+    manual_user_end_ts: float | None = None
 
     # Optional Kyutai token streamer for manual partials (only when STT_BACKEND=kyutai)
     manual_kyutai_streamer = None
@@ -365,10 +404,7 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
     current_response_task: asyncio.Task | None = None
     current_cancel_event: asyncio.Event | None = None
 
-    await websocket.send_json({"type": "pcm_stream_ready"})
-
-    # Turn timing telemetry (server epoch)
-    turn_metrics: dict[int, dict] = {}
+    await _send_json({"type": "pcm_stream_ready"})
 
     # STT partial streaming policy
     import os
@@ -392,88 +428,110 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
             try:
                 obj = json.loads(text_payload)
                 t = obj.get("type")
+                if t in ("new_conversation", "select_conversation"):
+                    cid = str(obj.get("conversation_id") or "").strip() or str(uuid4())
+                    conversation_id = cid
+                    st = _ensure_conv(conversation_id)
+                    conversation_history = list(st.get("history") or [])
+                    history_summary = str(st.get("summary") or "")
+                    await _send_json({"type": "conversation_ack", "conversation_id": conversation_id})
+                    continue
                 if t == "mode":
                     mode = str(obj.get("value") or "idle")
                     if mode not in ("idle", "manual", "auto"):
                         mode = "idle"
-                    await websocket.send_json({"type": "mode_ack", "value": mode})
+                    await _send_json({"type": "mode_ack", "value": mode})
+                    continue
+                if t == "client_audio_started":
+                    try:
+                        tid = int(obj.get("turn_id"))
+                        store = get_store()
+                        now = perf_counter()
+                        for tm in store.snapshot():
+                            if tm.turn_id == tid and tm.total_turn_ms is None:
+                                store.set_client_audio_start(tid, (now - tm.end_ts) * 1000.0)
+                                break
+                    except Exception:
+                        pass
                     continue
                 if t == "manual_start":
                     manual_active = True
                     manual_pcm_parts = []
                     manual_turn_id += 1
                     manual_partial_text = ""
+                    manual_user_end_ts = None
+                    # Start inflight metrics (end_ts updated on manual_end)
+                    get_store().start_turn(manual_turn_id, "manual", perf_counter())
                     if manual_kyutai_streamer is not None:
                         try:
                             manual_kyutai_streamer.reset()
                         except Exception:
                             pass
-                    await websocket.send_json({"type": "manual_ack", "value": "started", "turn_id": manual_turn_id})
+                    await _send_json({"type": "manual_ack", "value": "started", "turn_id": manual_turn_id})
                     continue
                 if t == "manual_end":
                     manual_active = False
                     mode = "idle"
-                    await websocket.send_json({"type": "manual_ack", "value": "ended", "turn_id": manual_turn_id})
+                    await _send_json({"type": "manual_ack", "value": "ended", "turn_id": manual_turn_id})
 
                     if manual_pcm_parts:
-                        turn_end_epoch_ms = time.time() * 1000.0
-                        turn_metrics[manual_turn_id] = {
-                            "turn_id": manual_turn_id,
-                            "mode": "manual",
-                            "turn_end_epoch_ms": turn_end_epoch_ms,
-                            "stt_done_ms": None,
-                            "llm_first_token_ms": None,
-                            "llm_done_ms": None,
-                            "first_audio_sent_ms": None,
-                            "client_audio_start_ms": None,
-                            "client_audio_done_ms": None,
-                        }
+                        store = get_store()
+                        manual_user_end_ts = perf_counter()
+                        store.start_turn(manual_turn_id, "manual", manual_user_end_ts)
                         # Run STT once on full manual recording; no turn-taking involved.
                         pcm16 = b"".join(manual_pcm_parts)
                         audio_i16 = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32)
                         audio_f32 = (audio_i16 / 32768.0).clip(-1.0, 1.0)
                         wav_bytes = _float32_to_wav_bytes(audio_f32, sample_rate=16000)
                         user_text = stt.transcribe_audio(wav_bytes)
-                        turn_metrics[manual_turn_id]["stt_done_ms"] = time.time() * 1000.0
+                        store.set_stt_done(manual_turn_id, (perf_counter() - manual_user_end_ts) * 1000.0)
                         if not user_text:
-                            await websocket.send_json({"type": "error", "message": "Sorry, I couldn't understand that."})
+                            await _send_json({"type": "error", "message": "Sorry, I couldn't understand that."})
                             continue
-                        await websocket.send_json({"type": "user_text", "data": user_text, "turn_id": manual_turn_id})
+                        conv_id_local = conversation_id
+                        conv_state_local = _ensure_conv(conv_id_local)
+                        conv_history_local: list = list(conv_state_local.get("history") or [])
+                        conv_summary_local: str = str(conv_state_local.get("summary") or "")
+                        await _send_json(
+                            {"type": "user_text", "data": user_text, "turn_id": manual_turn_id},
+                            cid=conv_id_local,
+                        )
 
                         # Reuse existing response runner pattern
                         cancel_event = asyncio.Event()
                         current_cancel_event = cancel_event
 
                         async def run_response_manual():
-                            nonlocal speaking, history_summary, conversation_history
+                            nonlocal speaking, conv_history_local, conv_summary_local
                             speaking = True
                             llm_response_text = ""
                             sentence_buffer = ""
                             audio_chunk_count = 0
                             sentence_count = 0
 
-                            audio_by_sentence: dict[int, list[bytes]] = {}
-                            sentence_chunk_counts: dict[int, int] = {}
-                            send_condition = asyncio.Condition()
+                            sentence_queues: dict[int, asyncio.Queue[bytes]] = {}
+                            sentence_done: dict[int, asyncio.Event] = {}
+                            sentence_ready = asyncio.Event()
                             llm_done = False
-                            tts_done_sentences: set[int] = set()
                             tts_tasks: list[asyncio.Task] = []
 
                             async def process_sentence_for_tts(sentence: str, sentence_idx: int):
                                 try:
-                                    def synthesize_sentence(s: str):
-                                        return list(tts.stream_speech(s))
-                                    chunks = await asyncio.get_event_loop().run_in_executor(
-                                        tts_executor, synthesize_sentence, sentence
-                                    )
-                                    filtered = [c for c in chunks if c]
-                                    async with send_condition:
-                                        audio_by_sentence[sentence_idx] = filtered
-                                        sentence_chunk_counts[sentence_idx] = len(filtered)
-                                        tts_done_sentences.add(sentence_idx)
-                                        send_condition.notify_all()
+                                    q = sentence_queues.get(sentence_idx)
+                                    if q is None:
+                                        q = asyncio.Queue()
+                                        sentence_queues[sentence_idx] = q
+                                    done_evt = sentence_done.get(sentence_idx)
+                                    if done_evt is None:
+                                        done_evt = asyncio.Event()
+                                        sentence_done[sentence_idx] = done_evt
+                                    sentence_ready.set()
+                                    await _stream_tts_chunks(sentence, q, done_evt, cancel_evt=cancel_event)
                                 except Exception as e:
                                     print(f"Error in TTS for sentence {sentence_idx}: {e}")
+                                    if sentence_idx not in sentence_done:
+                                        sentence_done[sentence_idx] = asyncio.Event()
+                                    sentence_done[sentence_idx].set()
 
                             async def ordered_audio_sender():
                                 nonlocal audio_chunk_count
@@ -481,59 +539,90 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                 while True:
                                     if cancel_event.is_set():
                                         return
-                                    async with send_condition:
-                                        await send_condition.wait_for(
-                                            lambda: (next_sentence in tts_done_sentences)
-                                            or (llm_done and next_sentence >= sentence_count)
-                                            or cancel_event.is_set()
-                                        )
-                                        if cancel_event.is_set():
-                                            return
+                                    if llm_done and next_sentence >= sentence_count and next_sentence not in sentence_queues:
+                                        return
+                                    if next_sentence not in sentence_queues:
                                         if llm_done and next_sentence >= sentence_count:
                                             return
-                                        chunks = audio_by_sentence.get(next_sentence, [])
-                                        chunk_count = sentence_chunk_counts.get(next_sentence, len(chunks))
+                                        await sentence_ready.wait()
+                                        sentence_ready.clear()
+                                        continue
 
-                                    for chunk_idx, audio_chunk in enumerate(chunks):
+                                    q = sentence_queues[next_sentence]
+                                    done_evt = sentence_done.get(next_sentence) or asyncio.Event()
+                                    sentence_done[next_sentence] = done_evt
+                                    sent = 0
+                                    while True:
                                         if cancel_event.is_set():
                                             return
-                                        audio_chunk_count += 1
-                                        if turn_metrics.get(manual_turn_id, {}).get("first_audio_sent_ms") is None:
-                                            turn_metrics[manual_turn_id]["first_audio_sent_ms"] = time.time() * 1000.0
-                                        payload = _pack_audio_header(manual_turn_id, next_sentence, chunk_idx, chunk_count) + audio_chunk
-                                        await websocket.send_bytes(payload)
-                                        await asyncio.sleep(0)
+                                        if q.empty() and done_evt.is_set():
+                                            break
+                                        get_task = asyncio.create_task(q.get())
+                                        done_task = asyncio.create_task(done_evt.wait())
+                                        done_set, _ = await asyncio.wait(
+                                            {get_task, done_task}, return_when=asyncio.FIRST_COMPLETED
+                                        )
+                                        if get_task in done_set:
+                                            done_task.cancel()
+                                            audio_chunk = get_task.result()
+                                            audio_chunk_count += 1
+                                            get_store().add_audio_chunk(manual_turn_id, len(audio_chunk))
+                                            audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
+                                            await _send_json(
+                                                {
+                                                    "type": "audio_chunk",
+                                                    "data": audio_base64,
+                                                    "turn_id": manual_turn_id,
+                                                    "sentence_idx": next_sentence,
+                                                    "chunk_idx": sent,
+                                                    "chunk_count": None,
+                                                    "final": False,
+                                                    "index": audio_chunk_count - 1,
+                                                }
+                                                , cid=conv_id_local
+                                            )
+                                            sent += 1
+                                            await asyncio.sleep(0)
+                                        else:
+                                            get_task.cancel()
+                                            break
 
-                                    await websocket.send_json(
+                                    await _send_json(
                                         {
                                             "type": "sentence_done",
                                             "turn_id": manual_turn_id,
                                             "sentence_idx": next_sentence,
-                                            "chunk_count": chunk_count,
+                                            "chunk_count": sent,
                                         }
+                                        , cid=conv_id_local
                                     )
                                     next_sentence += 1
 
                             sender_task = asyncio.create_task(ordered_audio_sender())
 
                             try:
-                                # LLM timing: first token and completion
                                 async for token_chunk in llm.stream_llm_response(
-                                    user_text, history=conversation_history, history_summary=history_summary
+                                    user_text, history=conv_history_local, history_summary=conv_summary_local
                                 ):
                                     if cancel_event.is_set():
                                         break
-                                    if turn_metrics.get(manual_turn_id, {}).get("llm_first_token_ms") is None:
-                                        turn_metrics[manual_turn_id]["llm_first_token_ms"] = time.time() * 1000.0
+                                    if manual_user_end_ts is not None:
+                                        get_store().set_llm_first(
+                                            manual_turn_id, (perf_counter() - manual_user_end_ts) * 1000.0
+                                        )
                                     llm_response_text += token_chunk
-                                    await websocket.send_json({"type": "llm_partial", "data": llm_response_text, "turn_id": manual_turn_id})
+                                    await _send_json(
+                                        {"type": "llm_partial", "data": llm_response_text, "turn_id": manual_turn_id},
+                                        cid=conv_id_local,
+                                    )
                                     complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                                     for sentence in complete_sentences:
                                         sentence_count += 1
                                         task = asyncio.create_task(process_sentence_for_tts(sentence, sentence_count - 1))
                                         tts_tasks.append(task)
-                                        await websocket.send_json(
-                                            {"type": "llm_chunk", "data": sentence, "sentence_idx": sentence_count - 1, "turn_id": manual_turn_id}
+                                        await _send_json(
+                                            {"type": "llm_chunk", "data": sentence, "sentence_idx": sentence_count - 1, "turn_id": manual_turn_id},
+                                            cid=conv_id_local,
                                         )
                             finally:
                                 if tts_tasks:
@@ -543,54 +632,56 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                     sentence_count += 1
                                     final_sentence = sentence_buffer.strip()
                                     await process_sentence_for_tts(final_sentence, sentence_count - 1)
-                                    await websocket.send_json(
-                                        {"type": "llm_chunk", "data": final_sentence, "sentence_idx": sentence_count - 1, "turn_id": manual_turn_id}
+                                    await _send_json(
+                                        {"type": "llm_chunk", "data": final_sentence, "sentence_idx": sentence_count - 1, "turn_id": manual_turn_id},
+                                        cid=conv_id_local,
                                     )
 
-                                async with send_condition:
-                                    llm_done = True
-                                    send_condition.notify_all()
+                                llm_done = True
+                                sentence_ready.set()
 
                                 try:
                                     await sender_task
                                 except Exception as e:
                                     print(f"Audio sender task error: {e}")
-                                turn_metrics[manual_turn_id]["llm_done_ms"] = time.time() * 1000.0
 
                             if cancel_event.is_set():
                                 speaking = False
                                 return
 
-                            conversation_history.extend(
+                            conv_history_local.extend(
                                 [{"role": "user", "content": user_text}, {"role": "assistant", "content": llm_response_text}]
                             )
                             try:
-                                if llm.should_summarize(conversation_history):
+                                if llm.should_summarize(conv_history_local):
                                     keep_n = getattr(llm, "HISTORY_KEEP_LAST_MESSAGES", 24)
-                                    older = conversation_history[:-keep_n]
+                                    older = conv_history_local[:-keep_n]
                                     if older:
-                                        history_summary = llm.summarize_history_locally(older, existing_summary=history_summary)
-                                        conversation_history = conversation_history[-keep_n:]
+                                        conv_summary_local = llm.summarize_history_locally(older, existing_summary=conv_summary_local)
+                                        conv_history_local = conv_history_local[-keep_n:]
                             except Exception as e:
                                 print(f"History summarization failed (continuing without summary): {e}")
 
-                            await websocket.send_json({"type": "stream_done", "data": llm_response_text, "turn_id": manual_turn_id})
-                            speaking = False
+                            # Persist the conversation state back to this conversation_id.
+                            conv_state_local["history"] = conv_history_local
+                            conv_state_local["summary"] = conv_summary_local
 
-                            m = turn_metrics.get(manual_turn_id, {})
-                            if m:
-                                te = m.get("turn_end_epoch_ms")
-                                log.info(
-                "[turn] "
-                                    f"id={manual_turn_id} mode=manual "
-                                    f"end_to_stt={((m.get('stt_done_ms')-te) if m.get('stt_done_ms') and te else 0):.0f}ms "
-                                    f"end_to_llm_first={((m.get('llm_first_token_ms')-te) if m.get('llm_first_token_ms') and te else 0):.0f}ms "
-                                    f"end_to_audio_sent={((m.get('first_audio_sent_ms')-te) if m.get('first_audio_sent_ms') and te else 0):.0f}ms "
-                                    f"end_to_client_audio_start={((m.get('client_audio_start_ms')-te) if m.get('client_audio_start_ms') and te else 0):.0f}ms "
-                                    f"llm_total={((m.get('llm_done_ms')-m.get('llm_first_token_ms')) if m.get('llm_done_ms') and m.get('llm_first_token_ms') else 0):.0f}ms "
-                                    f"audio_play_total={((m.get('client_audio_done_ms')-m.get('client_audio_start_ms')) if m.get('client_audio_done_ms') and m.get('client_audio_start_ms') else 0):.0f}ms "
-                                    f"turn_total={((m.get('client_audio_done_ms')-te) if m.get('client_audio_done_ms') and te else 0):.0f}ms"
-                                )
+                            await _send_json(
+                                {"type": "stream_done", "data": llm_response_text, "turn_id": manual_turn_id},
+                                cid=conv_id_local,
+                            )
+                            if manual_user_end_ts is not None:
+                                tm = get_store().finish_turn(manual_turn_id, (perf_counter() - manual_user_end_ts) * 1000.0)
+                                if tm:
+                                    print(
+                                        f"[turn_id={tm.turn_id} mode={tm.mode}] "
+                                        f"end→stt={tm.stt_done_ms or 0:.0f}ms "
+                                        f"end→llm1={tm.llm_first_ms or 0:.0f}ms "
+                                        f"end→client_audio={tm.client_audio_start_ms or 0:.0f}ms "
+                                        f"turn_total={tm.total_turn_ms or 0:.0f}ms "
+                                        f"chunks={tm.audio_chunks} sizes={tm.chunk_sizes}"
+                                    )
+                            speaking = False
 
                         if current_response_task:
                             try:
@@ -599,30 +690,15 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                 pass
                         current_response_task = asyncio.create_task(run_response_manual())
                     continue
-                if t == "client_audio_started":
-                    tid = int(obj.get("turn_id", -1))
-                    ts = float(obj.get("client_epoch_ms", 0.0))
-                    if tid in turn_metrics:
-                        turn_metrics[tid]["client_audio_start_ms"] = ts
-                    continue
-                if t == "client_audio_done":
-                    tid = int(obj.get("turn_id", -1))
-                    ts = float(obj.get("client_epoch_ms", 0.0))
-                    if tid in turn_metrics:
-                        turn_metrics[tid]["client_audio_done_ms"] = ts
-                    continue
                 if obj.get("type") == "cancel":
                     if current_cancel_event:
                         current_cancel_event.set()
                     if current_response_task:
                         current_response_task.cancel()
-                    await websocket.send_json({"type": "cancelled"})
+                    await _send_json({"type": "cancelled"})
             except Exception:
                 pass
             continue
-
-        # Client audio telemetry (binary playback timing)
-        # Note: telemetry is sent as JSON text frames.
 
         payload = message.get("bytes")
         if not payload:
@@ -647,7 +723,7 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                             manual_partial_text = str(step.text).strip()
                         elif step.text_delta:
                             manual_partial_text += step.text_delta
-                        await websocket.send_json(
+                        await _send_json(
                             {"type": "stt_partial", "data": manual_partial_text.strip(), "turn_id": manual_turn_id}
                         )
                 except Exception:
@@ -687,11 +763,11 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                         if txt and txt != partial_accum:
                             partial_accum = txt
                             last_partial_ts = now
-                            await websocket.send_json({"type": "stt_partial", "data": txt, "turn_id": turn_id})
+                            await _send_json({"type": "stt_partial", "data": txt, "turn_id": turn_id})
 
         # Optional: send turn-state telemetry at low rate (every 5 frames).
         if seq % 5 == 0:
-            await websocket.send_json(
+            await _send_json(
                 {
                     "type": "turn_state",
                     "state": decision.state,
@@ -709,7 +785,7 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                     current_cancel_event.set()
                 if current_response_task:
                     current_response_task.cancel()
-                await websocket.send_json({"type": "barge_in", "turn_id": turn_id})
+                await _send_json({"type": "barge_in", "turn_id": turn_id})
                 speaking = False
         else:
             barge_in_ms = 0.0
@@ -717,39 +793,34 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
         if segment is None or decision.state != TurnState.USER_FINISHED:
             continue
 
-        # Auto turn-end timing
-        turn_end_epoch_ms = time.time() * 1000.0
-        turn_metrics[turn_id] = {
-            "turn_id": turn_id,
-            "mode": "auto",
-            "turn_end_epoch_ms": turn_end_epoch_ms,
-            "stt_done_ms": None,
-            "llm_first_token_ms": None,
-            "llm_done_ms": None,
-            "first_audio_sent_ms": None,
-            "client_audio_start_ms": None,
-            "client_audio_done_ms": None,
-        }
-        # Help client compute end->play_start with shared epoch
-        await websocket.send_json({"type": "turn_end", "turn_id": turn_id, "turn_end_epoch_ms": turn_end_epoch_ms})
+        # Bind this turn to the active conversation at the moment the user finishes.
+        conv_id_local = conversation_id
+        conv_state_local = _ensure_conv(conv_id_local)
+        conv_history_local: list = list(conv_state_local.get("history") or [])
+        conv_summary_local: str = str(conv_state_local.get("summary") or "")
+
+        # Metrics: user end -> STT/LLM/audio/client playback
+        store = get_store()
+        user_end_ts = perf_counter()
+        store.start_turn(turn_id, "auto", user_end_ts)
 
         # Convert segment to WAV bytes and run STT -> LLM -> TTS.
         # If STT_BACKEND=kyutai, still do a final full transcription at turn-end
         # (partial streaming may refine once full context is available).
         wav_bytes = _float32_to_wav_bytes(segment.audio_f32, sample_rate=16000)
         user_text = stt.transcribe_audio(wav_bytes)
-        turn_metrics[turn_id]["stt_done_ms"] = time.time() * 1000.0
+        store.set_stt_done(turn_id, (perf_counter() - user_end_ts) * 1000.0)
         if not user_text:
-            await websocket.send_json({"type": "error", "message": "Sorry, I couldn't understand that."})
+            await _send_json({"type": "error", "message": "Sorry, I couldn't understand that."}, cid=conv_id_local)
             continue
 
-        await websocket.send_json({"type": "user_text", "data": user_text, "turn_id": turn_id})
+        await _send_json({"type": "user_text", "data": user_text, "turn_id": turn_id}, cid=conv_id_local)
 
         cancel_event = asyncio.Event()
         current_cancel_event = cancel_event
 
         async def run_response():
-            nonlocal history_summary, conversation_history, speaking
+            nonlocal speaking, conv_history_local, conv_summary_local
             speaking = True
 
             llm_start = perf_counter()
@@ -758,30 +829,29 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
             audio_chunk_count = 0
             sentence_count = 0
 
-            # Strict ordering buffers
-            audio_by_sentence: dict[int, list[bytes]] = {}
-            sentence_chunk_counts: dict[int, int] = {}
-            send_condition = asyncio.Condition()
+            sentence_queues: dict[int, asyncio.Queue[bytes]] = {}
+            sentence_done: dict[int, asyncio.Event] = {}
+            sentence_ready = asyncio.Event()
             llm_done = False
-            tts_done_sentences: set[int] = set()
             tts_tasks: list[asyncio.Task] = []
 
             async def process_sentence_for_tts(sentence: str, sentence_idx: int):
                 try:
-                    def synthesize_sentence(s: str):
-                        return list(tts.stream_speech(s))
-
-                    chunks = await asyncio.get_event_loop().run_in_executor(
-                        tts_executor, synthesize_sentence, sentence
-                    )
-                    filtered = [c for c in chunks if c]
-                    async with send_condition:
-                        audio_by_sentence[sentence_idx] = filtered
-                        sentence_chunk_counts[sentence_idx] = len(filtered)
-                        tts_done_sentences.add(sentence_idx)
-                        send_condition.notify_all()
+                    q = sentence_queues.get(sentence_idx)
+                    if q is None:
+                        q = asyncio.Queue()
+                        sentence_queues[sentence_idx] = q
+                    done_evt = sentence_done.get(sentence_idx)
+                    if done_evt is None:
+                        done_evt = asyncio.Event()
+                        sentence_done[sentence_idx] = done_evt
+                    sentence_ready.set()
+                    await _stream_tts_chunks(sentence, q, done_evt, cancel_evt=cancel_event)
                 except Exception as e:
                     print(f"Error in TTS for sentence {sentence_idx}: {e}")
+                    if sentence_idx not in sentence_done:
+                        sentence_done[sentence_idx] = asyncio.Event()
+                    sentence_done[sentence_idx].set()
 
             async def ordered_audio_sender():
                 nonlocal audio_chunk_count
@@ -789,36 +859,62 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                 while True:
                     if cancel_event.is_set():
                         return
-                    async with send_condition:
-                        await send_condition.wait_for(
-                            lambda: (next_sentence in tts_done_sentences)
-                            or (llm_done and next_sentence >= sentence_count)
-                            or cancel_event.is_set()
-                        )
-                        if cancel_event.is_set():
-                            return
+                    if llm_done and next_sentence >= sentence_count and next_sentence not in sentence_queues:
+                        return
+                    if next_sentence not in sentence_queues:
                         if llm_done and next_sentence >= sentence_count:
                             return
-                        chunks = audio_by_sentence.get(next_sentence, [])
-                        chunk_count = sentence_chunk_counts.get(next_sentence, len(chunks))
+                        await sentence_ready.wait()
+                        sentence_ready.clear()
+                        continue
 
-                    for chunk_idx, audio_chunk in enumerate(chunks):
+                    q = sentence_queues[next_sentence]
+                    done_evt = sentence_done.get(next_sentence) or asyncio.Event()
+                    sentence_done[next_sentence] = done_evt
+                    sent = 0
+                    while True:
                         if cancel_event.is_set():
                             return
-                        audio_chunk_count += 1
-                        if turn_metrics.get(turn_id, {}).get("first_audio_sent_ms") is None:
-                            turn_metrics[turn_id]["first_audio_sent_ms"] = time.time() * 1000.0
-                        payload = _pack_audio_header(turn_id, next_sentence, chunk_idx, chunk_count) + audio_chunk
-                        await websocket.send_bytes(payload)
-                        await asyncio.sleep(0)
+                        if q.empty() and done_evt.is_set():
+                            break
+                        get_task = asyncio.create_task(q.get())
+                        done_task = asyncio.create_task(done_evt.wait())
+                        done_set, _ = await asyncio.wait(
+                            {get_task, done_task}, return_when=asyncio.FIRST_COMPLETED
+                        )
+                        if get_task in done_set:
+                            done_task.cancel()
+                            audio_chunk = get_task.result()
+                            audio_chunk_count += 1
+                            store.add_audio_chunk(turn_id, len(audio_chunk))
+                            audio_base64 = base64.b64encode(audio_chunk).decode("utf-8")
+                            await _send_json(
+                                {
+                                    "type": "audio_chunk",
+                                    "data": audio_base64,
+                                    "turn_id": turn_id,
+                                    "sentence_idx": next_sentence,
+                                    "chunk_idx": sent,
+                                    "chunk_count": None,
+                                    "final": False,
+                                    "index": audio_chunk_count - 1,
+                                }
+                                , cid=conv_id_local
+                            )
+                            sent += 1
+                            await asyncio.sleep(0)
+                        else:
+                            get_task.cancel()
+                            break
 
-                    await websocket.send_json(
+                    await _send_json(
                         {
                             "type": "sentence_done",
                             "turn_id": turn_id,
                             "sentence_idx": next_sentence,
-                            "chunk_count": chunk_count,
+                            "chunk_count": sent,
                         }
+                        , cid=conv_id_local
                     )
                     next_sentence += 1
 
@@ -826,21 +922,24 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
 
             try:
                 async for token_chunk in llm.stream_llm_response(
-                    user_text, history=conversation_history, history_summary=history_summary
+                    user_text, history=conv_history_local, history_summary=conv_summary_local
                 ):
                     if cancel_event.is_set():
                         break
-                    if turn_metrics.get(turn_id, {}).get("llm_first_token_ms") is None:
-                        turn_metrics[turn_id]["llm_first_token_ms"] = time.time() * 1000.0
+                    store.set_llm_first(turn_id, (perf_counter() - user_end_ts) * 1000.0)
                     llm_response_text += token_chunk
-                    await websocket.send_json({"type": "llm_partial", "data": llm_response_text, "turn_id": turn_id})
+                    await _send_json(
+                        {"type": "llm_partial", "data": llm_response_text, "turn_id": turn_id},
+                        cid=conv_id_local,
+                    )
                     complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                     for sentence in complete_sentences:
                         sentence_count += 1
                         task = asyncio.create_task(process_sentence_for_tts(sentence, sentence_count - 1))
                         tts_tasks.append(task)
-                        await websocket.send_json(
-                            {"type": "llm_chunk", "data": sentence, "sentence_idx": sentence_count - 1, "turn_id": turn_id}
+                        await _send_json(
+                            {"type": "llm_chunk", "data": sentence, "sentence_idx": sentence_count - 1, "turn_id": turn_id},
+                            cid=conv_id_local,
                         )
             finally:
                 if tts_tasks:
@@ -850,54 +949,51 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                     sentence_count += 1
                     final_sentence = sentence_buffer.strip()
                     await process_sentence_for_tts(final_sentence, sentence_count - 1)
-                    await websocket.send_json(
-                        {"type": "llm_chunk", "data": final_sentence, "sentence_idx": sentence_count - 1, "turn_id": turn_id}
+                    await _send_json(
+                        {"type": "llm_chunk", "data": final_sentence, "sentence_idx": sentence_count - 1, "turn_id": turn_id},
+                        cid=conv_id_local,
                     )
 
-                async with send_condition:
-                    llm_done = True
-                    send_condition.notify_all()
+                llm_done = True
+                sentence_ready.set()
 
                 try:
                     await sender_task
                 except Exception as e:
                     print(f"Audio sender task error: {e}")
-                turn_metrics[turn_id]["llm_done_ms"] = time.time() * 1000.0
 
             if cancel_event.is_set():
                 speaking = False
                 return
 
-            conversation_history.extend(
+            conv_history_local.extend(
                 [{"role": "user", "content": user_text}, {"role": "assistant", "content": llm_response_text}]
             )
             try:
-                if llm.should_summarize(conversation_history):
+                if llm.should_summarize(conv_history_local):
                     keep_n = getattr(llm, "HISTORY_KEEP_LAST_MESSAGES", 24)
-                    older = conversation_history[:-keep_n]
+                    older = conv_history_local[:-keep_n]
                     if older:
-                        history_summary = llm.summarize_history_locally(older, existing_summary=history_summary)
-                        conversation_history = conversation_history[-keep_n:]
+                        conv_summary_local = llm.summarize_history_locally(older, existing_summary=conv_summary_local)
+                        conv_history_local = conv_history_local[-keep_n:]
             except Exception as e:
                 print(f"History summarization failed (continuing without summary): {e}")
 
-            await websocket.send_json({"type": "stream_done", "data": llm_response_text, "turn_id": turn_id})
-            speaking = False
+            conv_state_local["history"] = conv_history_local
+            conv_state_local["summary"] = conv_summary_local
 
-            m = turn_metrics.get(turn_id, {})
-            if m:
-                te = m.get("turn_end_epoch_ms")
-                log.info(
-                    "[turn] "
-                    f"id={turn_id} mode=auto "
-                    f"end_to_stt={((m.get('stt_done_ms')-te) if m.get('stt_done_ms') and te else 0):.0f}ms "
-                    f"end_to_llm_first={((m.get('llm_first_token_ms')-te) if m.get('llm_first_token_ms') and te else 0):.0f}ms "
-                    f"end_to_audio_sent={((m.get('first_audio_sent_ms')-te) if m.get('first_audio_sent_ms') and te else 0):.0f}ms "
-                    f"end_to_client_audio_start={((m.get('client_audio_start_ms')-te) if m.get('client_audio_start_ms') and te else 0):.0f}ms "
-                    f"llm_total={((m.get('llm_done_ms')-m.get('llm_first_token_ms')) if m.get('llm_done_ms') and m.get('llm_first_token_ms') else 0):.0f}ms "
-                    f"audio_play_total={((m.get('client_audio_done_ms')-m.get('client_audio_start_ms')) if m.get('client_audio_done_ms') and m.get('client_audio_start_ms') else 0):.0f}ms "
-                    f"turn_total={((m.get('client_audio_done_ms')-te) if m.get('client_audio_done_ms') and te else 0):.0f}ms"
+            await _send_json({"type": "stream_done", "data": llm_response_text, "turn_id": turn_id}, cid=conv_id_local)
+            tm = store.finish_turn(turn_id, (perf_counter() - user_end_ts) * 1000.0)
+            if tm:
+                print(
+                    f"[turn_id={tm.turn_id} mode={tm.mode}] "
+                    f"end→stt={tm.stt_done_ms or 0:.0f}ms "
+                    f"end→llm1={tm.llm_first_ms or 0:.0f}ms "
+                    f"end→client_audio={tm.client_audio_start_ms or 0:.0f}ms "
+                    f"turn_total={tm.total_turn_ms or 0:.0f}ms "
+                    f"chunks={tm.audio_chunks} sizes={tm.chunk_sizes}"
                 )
+            speaking = False
 
         # Cancel any prior response task before starting new one.
         if current_response_task:
