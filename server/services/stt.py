@@ -26,6 +26,7 @@ _DEFAULT_BACKEND = os.getenv(
 )
 STT_BACKEND = os.getenv("STT_BACKEND", _DEFAULT_BACKEND).lower()
 STT_FALLBACK_TO_WHISPER = os.getenv("STT_FALLBACK_TO_WHISPER", "1") == "1"
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "en").lower()
 
 # Silence the most common transformer warnings/log spam.
 warnings.filterwarnings("ignore", message=".*Special tokens have been added.*")
@@ -276,7 +277,8 @@ def _transcribe_with_mlx_funasr(audio_data: np.ndarray) -> str:
     wav_path = None
     try:
         wav_path = _float32_to_wav_path(audio_data, sample_rate=16000)
-        result = model.generate(wav_path)
+        # Pass language parameter if supported by the model
+        result = model.generate(wav_path, language=STT_LANGUAGE)
         text = getattr(result, "text", None)
         return (text or "").strip()
     finally:
@@ -304,7 +306,7 @@ def _transcribe_with_mlx_funasr_streaming(audio_data: np.ndarray):
         wav_path = _float32_to_wav_path(audio_data, sample_rate=16000)
         # Use streaming mode to get token-level updates
         accumulated_text = ""
-        for chunk in model.generate(wav_path, stream=True):
+        for chunk in model.generate(wav_path, stream=True, language=STT_LANGUAGE):
             if chunk:
                 # Handle both string chunks and result objects
                 if hasattr(chunk, 'text'):
@@ -406,13 +408,13 @@ def _transcribe_with_whisper(audio_data: np.ndarray) -> str:
             v = v.half()
         inputs[k] = v
     
-    # Generate transcription with explicit language='en' to avoid language detection
+    # Generate transcription with explicit language
     # Use better generation parameters
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
             max_length=448,
-            language="en",
+            language=STT_LANGUAGE,
             task="transcribe",
             num_beams=1,  # Use greedy decoding for speed
             do_sample=False  # Deterministic output
@@ -454,7 +456,7 @@ def _transcribe_with_funasr(audio_data: np.ndarray) -> str:
     
     # Generate transcription
     with torch.no_grad():
-        generated_ids = model.generate(**inputs, max_length=448)
+        generated_ids = model.generate(**inputs, max_length=448, language=STT_LANGUAGE)
     
     # Decode
     transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
