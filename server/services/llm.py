@@ -25,10 +25,11 @@ GROQ_FALLBACK_MODELS = [
     if m.strip()
 ]
 GROQ_TIMEOUT_S = float(os.getenv("GROQ_TIMEOUT_S", "8.0"))
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", os.getenv("LLM_MAX_TOKENS", "1024")))
 
 # Local MLX fallback (Apple Silicon)
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "mlx-community/Qwen2.5-1.5B-Instruct-4bit")
-LOCAL_LLM_MAX_TOKENS = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "256"))
+LOCAL_LLM_MAX_TOKENS = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "1024"))
 LOCAL_LLM_TEMPERATURE = float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.7"))
 LOCAL_LLM_TOP_P = float(os.getenv("LOCAL_LLM_TOP_P", "0.9"))
 
@@ -48,7 +49,11 @@ SYSTEM_PROMPT = (
     "After that first 1–5 word sentence, continue with the full answer normally. "
     "Avoid long lists or detailed descriptions; use short headings only if needed. "
     "Engage and be proactive to keep the conversation flowing naturally. "
-    "DO NOT use emojis, emoticons, asterisks(*), or other odd characters that can't be spoken. Respond like natural speech, you can use punctuation to indicate emotions."
+    "DO NOT use emojis, emoticons, asterisks(*), or other odd characters that can't be spoken. Respond like natural speech; you can use punctuation to indicate emotions. "
+    "When you need to communicate numbers, math, equations, formulas, or computer code for text-to-speech, rewrite it into natural, speakable text. "
+    "Examples: say 'three point one four' instead of '3.14' when appropriate; say 'x squared' or 'x to the power of two'; say 'open paren' and 'close paren'; "
+    "say 'slash', 'dash', 'underscore', 'colon', and 'dot' for symbols; say 'equals' for '=' and 'not equal' for '!='. "
+    "For code, prefer describing it line by line in plain words and avoid dense punctuation-heavy formatting."
 )
 
 # --- Remote LLM (Groq) ---
@@ -118,7 +123,7 @@ def query_remote_llm(
                 chat_completion = groq_client.chat.completions.create(
                     messages=_build_messages(user_text, history, history_summary=history_summary),
                     model=model,
-                    max_tokens=200,
+                    max_tokens=GROQ_MAX_TOKENS,
                     temperature=0.7,
                 )
                 content = (chat_completion.choices[0].message.content or "").strip()
@@ -311,7 +316,7 @@ async def stream_llm_response(
                 stream = groq_client.chat.completions.create(
                     messages=_build_messages(user_text, history, history_summary=history_summary),
                     model=model,
-                    max_tokens=200,
+                    max_tokens=GROQ_MAX_TOKENS,
                     temperature=0.7,
                     stream=True,
                 )

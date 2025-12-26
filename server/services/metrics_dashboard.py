@@ -49,7 +49,9 @@ class MetricsStore:
         with self._lock:
             tm = self._inflight.get(turn_id)
             if tm:
-                tm.client_audio_start_ms = ms
+                # Record only the first time the client starts playback for this turn.
+                if tm.client_audio_start_ms is None:
+                    tm.client_audio_start_ms = max(0.0, float(ms))
 
     def add_audio_chunk(self, turn_id: int, size_bytes: int) -> None:
         with self._lock:

@@ -527,6 +527,22 @@ document.addEventListener("DOMContentLoaded", () => {
         if (state.currentId === convId) renderMessages();
     };
 
+    const appendAssistantDelta = (delta, convId) => {
+        const conv = getConv(convId);
+        if (!conv) return;
+        const d = String(delta || "");
+        if (!d) return;
+        const msgs = conv.messages || (conv.messages = []);
+        const last = msgs[msgs.length - 1];
+        if (!last || last.role !== "assistant" || !last.partial) {
+            msgs.push({ role: "assistant", text: d, partial: true, ts: nowIso() });
+        } else {
+            last.text = String(last.text || "") + d;
+        }
+        touchConversation(conv);
+        if (state.currentId === convId) renderMessages();
+    };
+
     const finalizeAssistantText = (text, convId) => {
         const conv = getConv(convId);
         if (!conv) return;
@@ -655,6 +671,7 @@ document.addEventListener("DOMContentLoaded", () => {
     let expectedChunkIdx = 0;
     const bufferedAudio = new Map(); // key: "sentence:chunk" -> objectURL
     const sentenceChunkCounts = new Map(); // sentence_idx -> chunk_count
+    const clientAudioStartedTurns = new Set(); // turn_id values we already notified server about
 
     // PCM streaming state (20ms frames @ 16kHz)
     let audioCtx = null;
@@ -685,6 +702,7 @@ document.addEventListener("DOMContentLoaded", () => {
         playbackTurnId = null;
         expectedSentenceIdx = 0;
         expectedChunkIdx = 0;
+        clientAudioStartedTurns.clear();
     };
 
     const wsSendJson = (obj) => {
@@ -816,7 +834,10 @@ document.addEventListener("DOMContentLoaded", () => {
                 // Notify server when client actually starts playback for this turn.
                 try {
                     if (websocket && websocket.readyState === WebSocket.OPEN && playbackTurnId !== null) {
-                        websocket.send(JSON.stringify({ type: "client_audio_started", turn_id: playbackTurnId }));
+                        if (!clientAudioStartedTurns.has(playbackTurnId)) {
+                            clientAudioStartedTurns.add(playbackTurnId);
+                            websocket.send(JSON.stringify({ type: "client_audio_started", turn_id: playbackTurnId }));
+                        }
                     }
                 } catch (e) {}
             })
@@ -1014,6 +1035,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 finalizeUserText(message.data, convId);
             } else if (message.type === "llm_partial") {
                 upsertAssistantPartial(message.data, convId);
+            } else if (message.type === "llm_token") {
+                // Prefer accumulated text if provided; otherwise append delta.
+                const acc = typeof message.accumulated === "string" ? message.accumulated : "";
+                const delta = typeof message.data === "string" ? message.data : "";
+                if (acc) upsertAssistantPartial(acc, convId);
+                else if (delta) appendAssistantDelta(delta, convId);
             } else if (message.type === "audio_chunk") {
                 if (message.data) {
                     statusDiv.textContent = "Playing response...";

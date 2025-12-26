@@ -274,11 +274,18 @@ async def _legacy_ws_loop(
 
             sender_task = asyncio.create_task(ordered_audio_sender())
 
+            pending_llm_delta = ""
+            last_llm_send_ts = perf_counter()
             async for token_chunk in llm.stream_llm_response(
                 user_text, history=conversation_history, history_summary=history_summary
             ):
                 llm_response_text += token_chunk
-                await websocket.send_json({"type": "llm_partial", "data": llm_response_text})
+                pending_llm_delta += token_chunk
+                tnow = perf_counter()
+                if (tnow - last_llm_send_ts) >= 0.08 or len(pending_llm_delta) >= 48:
+                    await websocket.send_json({"type": "llm_token", "data": pending_llm_delta})
+                    pending_llm_delta = ""
+                    last_llm_send_ts = tnow
                 complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                 for sentence in complete_sentences:
                     sentence_count += 1
@@ -287,6 +294,8 @@ async def _legacy_ws_loop(
                     await websocket.send_json(
                         {"type": "llm_chunk", "data": sentence, "sentence_idx": sentence_count - 1}
                     )
+            if pending_llm_delta:
+                await websocket.send_json({"type": "llm_token", "data": pending_llm_delta})
             
             if tts_tasks:
                 await asyncio.gather(*tts_tasks, return_exceptions=True)
@@ -673,6 +682,8 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                         sender_task = asyncio.create_task(ordered_audio_sender())
 
                         try:
+                            pending_llm_delta = ""
+                            last_llm_send_ts = perf_counter()
                             async for token_chunk in llm.stream_llm_response(
                                 text, history=conv_history_local, history_summary=conv_summary_local
                             ):
@@ -680,16 +691,26 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                     break
                                 store.set_llm_first(turn_id, (perf_counter() - user_end_ts) * 1000.0)
                                 llm_response_text += token_chunk
-                                await _send_json(
-                                    {"type": "llm_partial", "data": llm_response_text, "turn_id": turn_id},
-                                    cid=conv_id_local,
-                                )
+                                pending_llm_delta += token_chunk
+                                tnow = perf_counter()
+                                if (tnow - last_llm_send_ts) >= 0.08 or len(pending_llm_delta) >= 48:
+                                    await _send_json(
+                                        {"type": "llm_token", "data": pending_llm_delta, "turn_id": turn_id},
+                                        cid=conv_id_local,
+                                    )
+                                    pending_llm_delta = ""
+                                    last_llm_send_ts = tnow
                                 complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                                 for sentence in complete_sentences:
                                     sentence_count += 1
                                     task = asyncio.create_task(process_sentence_for_tts(sentence, sentence_count - 1))
                                     tts_tasks.append(task)
                         finally:
+                            if pending_llm_delta:
+                                await _send_json(
+                                    {"type": "llm_token", "data": pending_llm_delta, "turn_id": turn_id},
+                                    cid=conv_id_local,
+                                )
                             if tts_tasks:
                                 await asyncio.gather(*tts_tasks, return_exceptions=True)
 
@@ -896,6 +917,8 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                             sender_task = asyncio.create_task(ordered_audio_sender())
 
                             try:
+                                pending_llm_delta = ""
+                                last_llm_send_ts = perf_counter()
                                 async for token_chunk in llm.stream_llm_response(
                                     user_text, history=conv_history_local, history_summary=conv_summary_local
                                 ):
@@ -906,10 +929,19 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                             manual_turn_id, (perf_counter() - manual_user_end_ts) * 1000.0
                                         )
                                     llm_response_text += token_chunk
-                                    await _send_json(
-                                        {"type": "llm_partial", "data": llm_response_text, "turn_id": manual_turn_id},
-                                        cid=conv_id_local,
-                                    )
+                                    pending_llm_delta += token_chunk
+                                    tnow = perf_counter()
+                                    if (tnow - last_llm_send_ts) >= 0.08 or len(pending_llm_delta) >= 48:
+                                        await _send_json(
+                                            {
+                                                "type": "llm_token",
+                                                "data": pending_llm_delta,
+                                                "turn_id": manual_turn_id,
+                                            },
+                                            cid=conv_id_local,
+                                        )
+                                        pending_llm_delta = ""
+                                        last_llm_send_ts = tnow
                                     complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                                     for sentence in complete_sentences:
                                         sentence_count += 1
@@ -920,6 +952,11 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                                             cid=conv_id_local,
                                         )
                             finally:
+                                if pending_llm_delta:
+                                    await _send_json(
+                                        {"type": "llm_token", "data": pending_llm_delta, "turn_id": manual_turn_id},
+                                        cid=conv_id_local,
+                                    )
                                 if tts_tasks:
                                     await asyncio.gather(*tts_tasks, return_exceptions=True)
 
@@ -1341,6 +1378,8 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
 
             try:
                 try:
+                    pending_llm_delta = ""
+                    last_llm_send_ts = perf_counter()
                     async for token_chunk in llm.stream_llm_response(
                         user_text, history=conv_history_local, history_summary=conv_summary_local
                     ):
@@ -1348,10 +1387,15 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                             break
                         store.set_llm_first(turn_id, (perf_counter() - user_end_ts) * 1000.0)
                         llm_response_text += token_chunk
-                        await _send_json(
-                            {"type": "llm_partial", "data": llm_response_text, "turn_id": turn_id},
-                            cid=conv_id_local,
-                        )
+                        pending_llm_delta += token_chunk
+                        tnow = perf_counter()
+                        if (tnow - last_llm_send_ts) >= 0.08 or len(pending_llm_delta) >= 48:
+                            await _send_json(
+                                {"type": "llm_token", "data": pending_llm_delta, "turn_id": turn_id},
+                                cid=conv_id_local,
+                            )
+                            pending_llm_delta = ""
+                            last_llm_send_ts = tnow
                         complete_sentences, sentence_buffer = detect_complete_sentences(token_chunk, sentence_buffer)
                         for sentence in complete_sentences:
                             sentence_count += 1
@@ -1367,6 +1411,11 @@ async def _pcm_stream_ws_loop(websocket: WebSocket):
                         await _send_json({"type": "error", "message": f"LLM error: {e}"}, cid=conv_id_local)
                     cancel_event.set()
                 finally:
+                    if pending_llm_delta:
+                        await _send_json(
+                            {"type": "llm_token", "data": pending_llm_delta, "turn_id": turn_id},
+                            cid=conv_id_local,
+                        )
                     if tts_tasks:
                         await asyncio.gather(*tts_tasks, return_exceptions=True)
 
