@@ -11,18 +11,19 @@ from dotenv import load_dotenv
 import torch
 import numpy as np 
 from pydub import AudioSegment
+import logging
 
 # Load .env early so backend/model env vars are picked up.
 load_dotenv()
 
 # Determine device (CUDA if available, else CPU)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"STT using device: {DEVICE}")
+logging.getLogger("voice_assistant").info(f"STT using device: {DEVICE}")
 
 # Backend selection: "whisper" (default) or "funasr"
 _DEFAULT_BACKEND = os.getenv(
     "STT_BACKEND_DEFAULT",
-    "mlx_funasr" if sys.platform == "darwin" else "whisper",
+    "kyutai",
 )
 STT_BACKEND = os.getenv("STT_BACKEND", _DEFAULT_BACKEND).lower()
 STT_FALLBACK_TO_WHISPER = os.getenv("STT_FALLBACK_TO_WHISPER", "1") == "1"
@@ -70,6 +71,16 @@ MLX_FUNASR_MODEL_ID = os.getenv("MLX_FUNASR_MODEL_ID", "mlx-community/Fun-ASR-Na
 MLX_FUNASR_FALLBACK_MODEL_ID = os.getenv("MLX_FUNASR_FALLBACK_MODEL_ID", "mlx-community/Fun-ASR-Nano-2512-8bit")
 _mlx_funasr_model = None
 
+# Kyutai (Delayed Streams Modeling) STT on MLX via moshi_mlx
+# NOTE: The semantic VAD extra-heads path is available in the *-candle* checkpoints.
+# For best turn-taking, default to the candle repo.
+KYUTAI_STT_MODEL_ID = os.getenv("KYUTAI_STT_MODEL_ID", "kyutai/stt-1b-en_fr-candle")
+_kyutai_model = None
+_kyutai_text_tokenizer = None
+_kyutai_audio_tokenizer = None
+_kyutai_gen = None
+_kyutai_other_codebooks = None
+
 # If the user sets STT_BACKEND=funasr on macOS, treat it as an alias for mlx_funasr.
 # This avoids trying to load MLX model repos through Transformers.
 if sys.platform == "darwin" and STT_BACKEND == "funasr" and os.getenv("PREFER_MLX_FUNASR", "1") == "1":
@@ -115,6 +126,135 @@ def _get_mlx_funasr_model():
             else:
                 raise
     return _mlx_funasr_model
+
+
+def _linear_resample(x: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """
+    Fast linear resampler for 1D float32 arrays.
+    Good enough for STT input conversion 16k->24k.
+    """
+    if x.size == 0 or src_rate == dst_rate:
+        return x.astype(np.float32, copy=False)
+    x = x.astype(np.float32, copy=False).reshape(-1)
+    ratio = float(dst_rate) / float(src_rate)
+    n_out = int(round(x.shape[0] * ratio))
+    if n_out <= 1:
+        return np.zeros((0,), dtype=np.float32)
+    t = np.linspace(0.0, x.shape[0] - 1, num=n_out, dtype=np.float32)
+    i0 = np.floor(t).astype(np.int32)
+    i1 = np.minimum(i0 + 1, x.shape[0] - 1)
+    frac = t - i0.astype(np.float32)
+    return (x[i0] * (1.0 - frac) + x[i1] * frac).astype(np.float32)
+
+
+def _get_kyutai_moshi_mlx():
+    """
+    Load Kyutai moshi_mlx model + tokenizers and return a tuple:
+      (gen, text_tokenizer, audio_tokenizer, other_codebooks)
+    """
+    global _kyutai_model, _kyutai_text_tokenizer, _kyutai_audio_tokenizer, _kyutai_gen, _kyutai_other_codebooks
+
+    if _kyutai_gen is not None:
+        return _kyutai_gen, _kyutai_text_tokenizer, _kyutai_audio_tokenizer, _kyutai_other_codebooks
+
+    try:
+        import json
+        import mlx.core as mx  # type: ignore
+        import mlx.nn as nn  # type: ignore
+        import sentencepiece  # type: ignore
+        import rustymimi  # type: ignore
+        from huggingface_hub import hf_hub_download  # type: ignore
+        from moshi_mlx import models, utils  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "Kyutai STT backend requires moshi_mlx (+ huggingface_hub, rustymimi, sentencepiece)."
+        ) from e
+
+    lm_config_path = hf_hub_download(KYUTAI_STT_MODEL_ID, "config.json")
+    with open(lm_config_path, "r") as fobj:
+        cfg_dict = json.load(fobj)
+
+    mimi_weights = hf_hub_download(KYUTAI_STT_MODEL_ID, cfg_dict["mimi_name"])
+    moshi_name = cfg_dict.get("moshi_name", "model.safetensors")
+    moshi_weights = hf_hub_download(KYUTAI_STT_MODEL_ID, moshi_name)
+    tok_path = hf_hub_download(KYUTAI_STT_MODEL_ID, cfg_dict["tokenizer_name"])
+
+    lm_config = models.LmConfig.from_config_dict(cfg_dict)
+    model = models.Lm(lm_config)
+    model.set_dtype(mx.bfloat16)
+    if moshi_weights.endswith(".q4.safetensors"):
+        nn.quantize(model, bits=4, group_size=32)
+    elif moshi_weights.endswith(".q8.safetensors"):
+        nn.quantize(model, bits=8, group_size=64)
+
+    print(f"Loading Kyutai moshi weights from {moshi_weights}")
+    if KYUTAI_STT_MODEL_ID.endswith("-candle"):
+        model.load_pytorch_weights(moshi_weights, lm_config, strict=True)
+    else:
+        model.load_weights(moshi_weights, strict=True)
+
+    print(f"Loading Kyutai tokenizer from {tok_path}")
+    text_tokenizer = sentencepiece.SentencePieceProcessor(tok_path)  # type: ignore
+
+    print(f"Loading Kyutai audio tokenizer from {mimi_weights}")
+    generated_codebooks = lm_config.generated_codebooks
+    other_codebooks = lm_config.other_codebooks
+    mimi_codebooks = max(generated_codebooks, other_codebooks)
+    audio_tokenizer = rustymimi.Tokenizer(mimi_weights, num_codebooks=mimi_codebooks)  # type: ignore
+
+    model.warmup()
+    gen = models.LmGen(
+        model=model,
+        max_steps=4096,
+        text_sampler=utils.Sampler(top_k=25, temp=0),
+        audio_sampler=utils.Sampler(top_k=250, temp=0.8),
+        check=False,
+    )
+
+    _kyutai_model = model
+    _kyutai_text_tokenizer = text_tokenizer
+    _kyutai_audio_tokenizer = audio_tokenizer
+    _kyutai_gen = gen
+    _kyutai_other_codebooks = other_codebooks
+    return gen, text_tokenizer, audio_tokenizer, other_codebooks
+
+
+def _transcribe_with_kyutai(audio_data_16k: np.ndarray) -> str:
+    """
+    Run Kyutai STT (moshi_mlx) on a full utterance.
+    Input: float32 mono @16k
+    Output: text
+    """
+    gen, text_tok, audio_tok, other_codebooks = _get_kyutai_moshi_mlx()
+    try:
+        import mlx.core as mx  # type: ignore
+    except Exception as e:
+        raise RuntimeError("mlx is required for kyutai backend.") from e
+
+    # IMPORTANT: rustymimi expects NumPy float32 arrays (see Kyutai stt_from_mic_mlx.py).
+    # Keep audio blocks as NumPy for encode_step; convert only the resulting tokens to MLX.
+
+    # Resample to 24k and pad with 2s of silence like Kyutai scripts
+    audio_24k = _linear_resample(audio_data_16k, 16000, 24000)
+    audio_24k = np.concatenate([audio_24k, np.zeros((48000,), dtype=np.float32)], axis=0)
+    audio_24k = np.asarray(audio_24k, dtype=np.float32).reshape(-1)
+
+    out_parts: list[str] = []
+    # Process in 1920-sample blocks (80ms @24k)
+    for start_idx in range(0, (audio_24k.shape[0] // 1920) * 1920, 1920):
+        chunk = audio_24k[start_idx : start_idx + 1920]
+        # Match Kyutai mic script: block shape (1, 1920) then encode_step(block[None,0:1]) => (1,1,1920)
+        block = chunk.reshape(1, 1920).astype(np.float32, copy=False)
+        other_audio_tokens = audio_tok.encode_step(block[None, 0:1])
+        other_audio_tokens = mx.array(other_audio_tokens).transpose(0, 2, 1)[:, :, :other_codebooks]
+
+        text_token = gen.step(other_audio_tokens[0])
+        tid = int(text_token[0].item())
+        if tid not in (0, 3):
+            piece = text_tok.id_to_piece(tid)  # type: ignore
+            out_parts.append(piece.replace("▁", " "))
+
+    return "".join(out_parts).strip()
 
 
 def _float32_to_wav_path(audio_f32: np.ndarray, sample_rate: int = 16000) -> str:
@@ -233,11 +373,8 @@ def _transcribe_with_whisper(audio_data: np.ndarray) -> str:
     transcription = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
     result = transcription.strip()
     
-    # Debug output
-    if result:
-        print(f"Whisper transcription: '{result}'")
-    else:
-        print("WARNING: Whisper returned empty transcription")
+    if os.getenv("DEBUG_STT", "0") == "1":
+        logging.getLogger("voice_assistant").debug(f"Whisper transcription: '{result}'")
     
     return result
 
@@ -275,7 +412,12 @@ def _transcribe_with_funasr(audio_data: np.ndarray) -> str:
 def preload_stt() -> None:
     """Load STT model into memory at startup to avoid first-call latency."""
     try:
-        if STT_BACKEND == "mlx_funasr":
+        if STT_BACKEND == "kyutai":
+            _ = _get_kyutai_moshi_mlx()
+            # Warm up with dummy audio
+            _ = _transcribe_with_kyutai(np.zeros(16000, dtype=np.float32))
+            print(f"Kyutai STT backend preloaded ({KYUTAI_STT_MODEL_ID}).")
+        elif STT_BACKEND == "mlx_funasr":
             _ = _get_mlx_funasr_model()
             # Warm up with dummy audio
             _ = _transcribe_with_mlx_funasr(np.zeros(16000, dtype=np.float32))
@@ -342,18 +484,22 @@ def transcribe_audio(audio_bytes: bytes) -> str:
         # Ensure audio is in valid range and not all zeros
         audio_data = np.clip(audio_samples, -1.0, 1.0)
         
-        # Debug: Check audio characteristics
-        if np.max(np.abs(audio_data)) < 0.01:
-            print(f"WARNING: Audio appears to be very quiet (max amplitude: {np.max(np.abs(audio_data)):.6f})")
-        print(f"Audio stats: shape={audio_data.shape}, duration={len(audio_data)/16000:.2f}s, max={np.max(np.abs(audio_data)):.4f}, mean={np.mean(np.abs(audio_data)):.4f}")
+        if os.getenv("DEBUG_STT", "0") == "1":
+            logging.getLogger("voice_assistant").debug(
+                f"Audio stats: shape={audio_data.shape}, duration={len(audio_data)/16000:.2f}s, "
+                f"max={np.max(np.abs(audio_data)):.4f}, mean={np.mean(np.abs(audio_data)):.4f}"
+            )
 
-        # Transcribe with selected backend (auto-fallback to Whisper to avoid repeated FunASR load errors)
+        # Transcribe with selected backend (auto-fallback to Whisper to avoid repeated load errors)
         asr_start = perf_counter()
         text = ""
         backend_name = ""
         backend_used = STT_BACKEND
         try:
-            if STT_BACKEND == "mlx_funasr":
+            if STT_BACKEND == "kyutai":
+                text = _transcribe_with_kyutai(audio_data)
+                backend_name = f"kyutai ({KYUTAI_STT_MODEL_ID})"
+            elif STT_BACKEND == "mlx_funasr":
                 text = _transcribe_with_mlx_funasr(audio_data)
                 backend_name = f"mlx_funasr ({MLX_FUNASR_MODEL_ID})"
             elif STT_BACKEND == "whisper":
@@ -386,13 +532,13 @@ def transcribe_audio(audio_bytes: bytes) -> str:
                     text = ""
         asr_ms = (perf_counter() - asr_start) * 1000
         total_ms = (perf_counter() - wall_start) * 1000
-        print(
-            f"STT [{backend_name or backend_used}] (ms): decode+resample={decode_ms:.1f}, asr={asr_ms:.1f}, total={total_ms:.1f}"
+        logging.getLogger("voice_assistant").info(
+            f"STT [{backend_name or backend_used}] ms decode={decode_ms:.0f} asr={asr_ms:.0f} total={total_ms:.0f}"
         )
         
         return text
     except Exception as e:
-        print(f"Error during transcription: {e}")
+        logging.getLogger("voice_assistant").exception(f"Error during transcription: {e}")
         return ""
 
 if __name__ == '__main__':

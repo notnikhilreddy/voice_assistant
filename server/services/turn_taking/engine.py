@@ -9,6 +9,7 @@ from .decision import TurnDecision, TurnState
 from .prosody import ProsodyFeatures, ProsodyTracker
 from .ring_buffer import AudioFrame, AudioRingBuffer
 from .vad import SileroVAD
+from .smart_turn import SmartTurnDetector
 
 
 @dataclass
@@ -16,6 +17,7 @@ class TurnSegment:
     start_seq: int
     end_seq: int
     audio_f32: np.ndarray  # concatenated audio in [-1,1]
+    transcript: str = ""
 
 
 class TurnTakingEngine:
@@ -33,9 +35,24 @@ class TurnTakingEngine:
         frame_ms: int = 20,
         ring_seconds: float = 2.5,
     ):
+        import os
+
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
-        self.vad = SileroVAD(sample_rate=sample_rate)
+        self.turn_backend = os.getenv("TURN_TAKING_BACKEND", "smart_turn").lower()
+        self.vad = SileroVAD(sample_rate=sample_rate)  # used for speech gating / barge-in
+        self.smart_turn: Optional[SmartTurnDetector] = None
+        self.smart_turn_min_silence_ms = float(os.getenv("SMART_TURN_MIN_SILENCE_MS", "220"))
+        self.smart_turn_min_interval_ms = float(os.getenv("SMART_TURN_MIN_INTERVAL_MS", "220"))
+        self._last_smart_turn_ts = 0.0
+        self._last_smart_turn_prob = 0.0
+        if self.turn_backend == "smart_turn":
+            try:
+                self.smart_turn = SmartTurnDetector()
+            except Exception as e:
+                # Fall back to Silero+prosody if Kyutai deps/model aren't available.
+                print(f"SmartTurn unavailable; falling back to silero. Error: {e}")
+                self.turn_backend = "silero"
         self.prosody = ProsodyTracker(sample_rate=sample_rate, frame_ms=frame_ms, window_s=2.0)
         self.ring = AudioRingBuffer(max_seconds=ring_seconds, sample_rate=sample_rate)
 
@@ -93,6 +110,45 @@ class TurnTakingEngine:
                 self._silence_ms = 0.0
 
         feats = self.prosody.compute()
+
+        # Smart Turn: run only during silence and only at a limited rate.
+        if (
+            self.turn_backend == "smart_turn"
+            and self._in_speech
+            and self.smart_turn is not None
+            and self._silence_ms >= self.smart_turn_min_silence_ms
+        ):
+            import time
+
+            now_ms = time.time() * 1000.0
+            if (now_ms - self._last_smart_turn_ts) >= self.smart_turn_min_interval_ms:
+                start_seq = int(self._speech_start_seq or frame.seq)
+                # Include the silence tail up to current frame; SmartTurn expects full current turn audio.
+                frames = self.ring.slice_by_seq(start_seq, frame.seq)
+                audio_f32 = self.ring.concat_float32(frames)
+                try:
+                    res = self.smart_turn.predict(audio_f32)
+                    self._last_smart_turn_prob = res.probability_complete
+                    self._last_smart_turn_ts = now_ms
+                    if res.prediction_complete:
+                        end_seq = int(self._last_speech_seq or frame.seq)
+                        frames2 = self.ring.slice_by_seq(start_seq, end_seq)
+                        audio_f32_utt = self.ring.concat_float32(frames2)
+                        seg = TurnSegment(start_seq=start_seq, end_seq=end_seq, audio_f32=audio_f32_utt)
+                        self._last_decision = TurnDecision(
+                            state=TurnState.USER_FINISHED,
+                            p_speech=p,
+                            silence_ms=self._silence_ms,
+                            reason=f"smart_turn prob={res.probability_complete:.3f}",
+                        )
+                        # reset
+                        self._in_speech = False
+                        self._speech_start_seq = None
+                        self._last_speech_seq = None
+                        self._silence_ms = 0.0
+                        return self._last_decision, seg
+                except Exception as e:
+                    print(f"SmartTurn runtime error (falling back to heuristics): {e}")
 
         if self._in_speech and self._silence_ms >= self.finish_silence_ms and self._should_shift(feats):
             # finalize segment: from speech_start_seq to last_speech_seq

@@ -34,6 +34,13 @@ class SileroVAD:
         self._ort_in_name = None
         self._ort_sr_name = None
 
+        # Allow forcing the lightweight energy VAD even if the ONNX file exists.
+        # Useful when Silero ONNX init is noisy/slow or when you only need a gatekeeper.
+        if os.getenv("SILERO_VAD_FORCE_FALLBACK", "0") == "1":
+            print("Silero VAD: forced energy fallback (SILERO_VAD_FORCE_FALLBACK=1).")
+            self._use_fallback = True
+            return
+
         model_path = os.getenv(
             "SILERO_VAD_ONNX_PATH",
             str(Path(__file__).resolve().parents[3] / "models" / "silero_vad.onnx"),

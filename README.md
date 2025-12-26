@@ -10,8 +10,9 @@ This project is designed to run on Linux with NVIDIA CUDA GPUs and uses PyTorch 
 - **Web-based Client:** Simple and accessible client that runs in any modern browser.
 - **Remote LLM (Groq):** Streams tokens so speech can start before the full reply is ready.
 - **Local First AI:**
-  - **STT:** Speech-to-Text via Whisper (PyTorch/CUDA) running locally on GPU.
+  - **STT:** Speech-to-Text via selectable backend (Kyutai / FunASR / Whisper).
   - **TTS:** Text-to-Speech via Kokoro/pyttsx3 locally.
+  - **Turn-taking:** End-of-turn detection via Smart Turn v3 (default) or Silero VAD fallback.
 
 ## Setup Instructions
 
@@ -59,6 +60,46 @@ The application uses the Groq API for complex questions. You will need an API ke
    cp .env.example .env
    ```
 2. Open the `.env` file and replace `"YOUR_GROQ_API_KEY_HERE"` with your actual Groq API key.
+
+#### STT + turn-taking configuration
+
+- **`STT_BACKEND`** (default: `kyutai`)
+  - `kyutai`: Kyutai delayed-streams-modeling STT on MLX (`moshi_mlx`)
+  - `funasr`: MLX Fun-ASR Nano via `mlx-audio-plus`
+  - `whisper`: Whisper tiny via Transformers
+
+- **`TURN_TAKING_BACKEND`** (default: `smart_turn`)
+  - `smart_turn`: pipecat Smart Turn v3 (audio-native endpoint model)
+  - `silero`: Silero VAD + prosody heuristics
+
+- **Smart Turn model selection**
+  - `SMART_TURN_REPO_ID` default is `pipecat-ai/smart-turn-v3`
+  - `SMART_TURN_ONNX_FILENAME` optional (if the repo file name changes)
+  - `SMART_TURN_THRESHOLD` (default `0.5`)
+  - `SMART_TURN_MIN_SILENCE_MS` (default `220`) how much trailing silence before running Smart Turn
+  - `SMART_TURN_MIN_INTERVAL_MS` (default `220`) rate limit for Smart Turn calls during silence
+
+- **Gatekeeper VAD (speech/silence + barge-in)**
+  - Even with `TURN_TAKING_BACKEND=smart_turn`, we still run a lightweight VAD to gate Smart Turn and support barge-in.
+  - To avoid loading Silero ONNX and use the lightweight energy fallback instead, set:
+    - `SILERO_VAD_FORCE_FALLBACK=1`
+
+#### Manual vs Auto capture
+
+- **Hold-to-speak (manual)**: records until you release the button. **No turn-taking model is used**; the full audio is transcribed after release.
+- **Auto voice detection (auto)**: streams audio continuously and uses `TURN_TAKING_BACKEND` to decide **Hold vs Shift**.
+
+#### Streaming partial transcripts (optional)
+
+The server can stream partial `stt_partial` updates (live-updating the “You:” line):
+
+- **`STT_STREAMING`**:
+  - `auto` (default): only Kyutai native partials
+  - `on`: enable best-effort partials for Whisper/FunASR too (auto-disables per session if too slow)
+  - `off`: disable partial STT updates
+- **`STT_STREAM_INTERVAL_MS`** (default `600`): how often to send partials (Whisper/FunASR).
+- **`STT_STREAM_WINDOW_MS`** (default `1600`): sliding window size used for partial decoding (Whisper/FunASR).
+- **`STT_STREAM_MAX_RTF`** (default `1.0`): if decode is slower than realtime, partials are disabled for that session.
 
 ## How to Run
 

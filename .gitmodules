@@ -1,0 +1,6 @@
+[submodule "kyutai-labs/delayed-streams-modeling"]
+	path = kyutai-labs/delayed-streams-modeling
+	url = https://github.com/kyutai-labs/delayed-streams-modeling
+[submodule "pipecat-ai/smart-turn"]
+	path = pipecat-ai/smart-turn
+	url = https://github.com/pipecat-ai/smart-turn

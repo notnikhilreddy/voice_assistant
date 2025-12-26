@@ -1,5 +1,6 @@
 import io
 import os
+import logging
 import re
 import subprocess
 import tempfile
@@ -355,7 +356,8 @@ def stream_speech(text: str) -> Generator[bytes, None, None]:
                     continue
                 part_yielded = True
                 any_yielded = True
-                print(f"Kokoro stream chunk bytes={len(chunk)}")
+                if os.getenv("DEBUG_AUDIO", "0") == "1":
+                    logging.getLogger("voice_assistant").debug(f"Kokoro stream chunk bytes={len(chunk)}")
                 yield chunk
 
         if part_yielded:
